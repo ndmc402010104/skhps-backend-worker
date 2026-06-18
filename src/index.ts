@@ -1,12 +1,30 @@
 /*
  * 檔案位置：skhps-backend-worker/src/index.ts
- * 時間戳記：2026-06-17
- * 用途：SKHPS 新後端 Cloudflare Worker。提供 health、ping、listExternalProjects。
+ * 時間戳記：2026-06-18
+ * 用途：SKHPS 新後端 Cloudflare Worker。
+ *
+ * 目前提供：
+ * - GET  /api/health
+ * - POST /api/action
+ *   - ping
+ *   - listExternalProjects
+ * - POST /api/upload-file
+ *
+ * 原則：
+ * - /api/upload-file 是背景 backend 行為。
+ * - 不屬於 loading gate。
+ * - 不要把 uploadFile 加進 loadingTasks。
+ * - Supabase key 只存在 Cloudflare / .dev.vars，不進前端、不進 config.json。
  */
 
 export interface Env {
   SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
+
+  SUPABASE_STORAGE_BUCKET?: string;
+  SUPABASE_UPLOAD_TABLE?: string;
+  MAX_FILE_SIZE_BYTES?: string;
+
   SKHPS_CACHE: KVNamespace;
 }
 
@@ -40,11 +58,38 @@ type AppCardRow = {
   metadata?: Record<string, unknown>;
 };
 
+type UploadRecord = {
+  app_id: string;
+  env: string;
+  bucket: string;
+  object_path: string;
+  original_name: string | null;
+  content_type: string | null;
+  size_bytes: number;
+  source: string;
+  status: string;
+  meta: Record<string, unknown>;
+};
+
+/*
+ * 不直接用 File / FormDataEntryValue 型別，避免目前 tsconfig / worker types 報錯。
+ * 實際 Cloudflare Worker 裡 formData().get("file") 會拿到類 File/Blob 物件。
+ */
+type WorkerUploadFile = Blob & {
+  name?: string;
+  size: number;
+  type?: string;
+};
+
+const DEFAULT_UPLOAD_BUCKET = "skhps-uploads";
+const DEFAULT_UPLOAD_TABLE = "skhps_file_uploads";
+const DEFAULT_MAX_FILE_SIZE_BYTES = 6 * 1024 * 1024;
+
 function corsHeaders(): HeadersInit {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type,Authorization,X-SKHPS-Client"
+    "Access-Control-Allow-Headers": "Content-Type,Authorization,X-SKHPS-Client,X-SKHPS-App-Id,X-SKHPS-Env"
   };
 }
 
@@ -66,7 +111,19 @@ async function readJson(request: Request): Promise<any> {
   }
 }
 
+function getSupabaseBaseUrl(env: Env): string {
+  if (!env.SUPABASE_URL) {
+    throw new Error("MISSING_SUPABASE_URL");
+  }
+
+  return env.SUPABASE_URL.replace(/\/+$/, "");
+}
+
 function getSupabaseHeaders(env: Env): HeadersInit {
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error("MISSING_SUPABASE_SERVICE_ROLE_KEY");
+  }
+
   return {
     "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
     "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -75,7 +132,7 @@ function getSupabaseHeaders(env: Env): HeadersInit {
 }
 
 async function supabaseGet<T>(env: Env, path: string): Promise<T> {
-  const baseUrl = env.SUPABASE_URL.replace(/\/+$/, "");
+  const baseUrl = getSupabaseBaseUrl(env);
   const url = `${baseUrl}/rest/v1/${path.replace(/^\/+/, "")}`;
 
   const response = await fetch(url, {
@@ -91,10 +148,191 @@ async function supabaseGet<T>(env: Env, path: string): Promise<T> {
   return await response.json() as T;
 }
 
+async function supabasePost<T>(
+  env: Env,
+  table: string,
+  record: Record<string, unknown>
+): Promise<T> {
+  const baseUrl = getSupabaseBaseUrl(env);
+  const safeTable = table.replace(/^\/+/, "");
+
+  const response = await fetch(`${baseUrl}/rest/v1/${safeTable}`, {
+    method: "POST",
+    headers: {
+      ...getSupabaseHeaders(env),
+      "Prefer": "return=representation"
+    },
+    body: JSON.stringify(record)
+  });
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`SUPABASE_POST_FAILED ${response.status} ${text}`);
+  }
+
+  try {
+    return text ? JSON.parse(text) as T : ([] as T);
+  } catch {
+    return [{ raw: text }] as T;
+  }
+}
+
 function normalizeEnv(input: unknown): "local" | "dev" | "prod" {
   const value = String(input || "prod").toLowerCase();
   if (value === "local" || value === "dev" || value === "prod") return value;
   return "prod";
+}
+
+function sanitizeSegment(input: unknown, fallback = "unknown"): string {
+  const value = String(input || fallback)
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^\.+/, "_")
+    .replace(/\.+$/, "")
+    .slice(0, 120);
+
+  return value || fallback;
+}
+
+function getSafeStorageFileName(file: WorkerUploadFile): string {
+  const originalName = getUploadFileName(file);
+  const dotIndex = originalName.lastIndexOf(".");
+  const rawBase = dotIndex > 0 ? originalName.slice(0, dotIndex) : originalName;
+  const rawExt = dotIndex > 0 ? originalName.slice(dotIndex + 1) : "";
+
+  const safeBase = sanitizeSegment(rawBase, "upload");
+  const safeExt = sanitizeSegment(rawExt, "");
+
+  if (safeExt) {
+    return safeBase + "." + safeExt;
+  }
+
+  return safeBase;
+}
+
+function encodeObjectPath(path: string): string {
+  return path
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
+function parseMeta(input: unknown): Record<string, unknown> {
+  if (!input) return {};
+
+  try {
+    const parsed = JSON.parse(String(input));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+function isUploadedFile(value: unknown): value is WorkerUploadFile {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const candidate = value as Partial<WorkerUploadFile>;
+
+  return (
+    typeof candidate.arrayBuffer === "function" &&
+    typeof candidate.size === "number"
+  );
+}
+
+function getUploadBucket(env: Env, form: FormData): string {
+  return String(
+    form.get("bucket") ||
+    env.SUPABASE_STORAGE_BUCKET ||
+    DEFAULT_UPLOAD_BUCKET
+  );
+}
+
+function getUploadTable(env: Env): string {
+  return String(env.SUPABASE_UPLOAD_TABLE || DEFAULT_UPLOAD_TABLE);
+}
+
+function getMaxFileSize(env: Env): number {
+  const value = Number(env.MAX_FILE_SIZE_BYTES || DEFAULT_MAX_FILE_SIZE_BYTES);
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_MAX_FILE_SIZE_BYTES;
+  return value;
+}
+
+function getUploadFileName(file: WorkerUploadFile): string {
+  return String(file.name || "upload.bin");
+}
+
+function getUploadFileType(file: WorkerUploadFile): string {
+  return String(file.type || "application/octet-stream");
+}
+
+function makeObjectPath(input: {
+  appId: string;
+  envName: string;
+  file: WorkerUploadFile;
+  requestedPath: string;
+}): string {
+  if (input.requestedPath) {
+    return String(input.requestedPath)
+      .replace(/^\/+/, "")
+      .replace(/\.\./g, "_");
+  }
+
+  const now = new Date();
+  const yyyy = String(now.getUTCFullYear());
+  const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(now.getUTCDate()).padStart(2, "0");
+
+  const safeAppId = sanitizeSegment(input.appId, "unknown-app");
+  const safeEnv = sanitizeSegment(input.envName, "unknown");
+  const safeName = getSafeStorageFileName(input.file);
+  const randomId = crypto.randomUUID();
+
+  return `${safeAppId}/${safeEnv}/${yyyy}/${mm}/${dd}/${randomId}-${safeName}`;
+}
+
+async function uploadToSupabaseStorage(input: {
+  env: Env;
+  bucket: string;
+  objectPath: string;
+  file: WorkerUploadFile;
+}): Promise<unknown> {
+  const baseUrl = getSupabaseBaseUrl(input.env);
+
+  const url =
+    `${baseUrl}/storage/v1/object/` +
+    `${encodeURIComponent(input.bucket)}/` +
+    `${encodeObjectPath(input.objectPath)}`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "apikey": input.env.SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": `Bearer ${input.env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": getUploadFileType(input.file),
+      "x-upsert": "false"
+    },
+    body: input.file
+  });
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`SUPABASE_STORAGE_UPLOAD_FAILED ${response.status} ${text}`);
+  }
+
+  try {
+    return text ? JSON.parse(text) : null;
+  } catch {
+    return { raw: text };
+  }
 }
 
 async function listExternalProjects(env: Env, appEnv: "local" | "dev" | "prod") {
@@ -199,6 +437,111 @@ async function listExternalProjects(env: Env, appEnv: "local" | "dev" | "prod") 
   return payload;
 }
 
+async function handleUploadFile(request: Request, env: Env): Promise<Response> {
+  const contentType =
+    request.headers.get("Content-Type") ||
+    request.headers.get("content-type") ||
+    "";
+
+  if (!contentType.toLowerCase().includes("multipart/form-data")) {
+    return json({
+      ok: false,
+      action: "uploadFile",
+      error: "CONTENT_TYPE_NOT_ALLOWED",
+      message: "uploadFile requires multipart/form-data"
+    }, 415);
+  }
+
+  const form = await request.formData();
+
+  const maybeFile = form.get("file");
+
+  if (!isUploadedFile(maybeFile)) {
+    return json({
+      ok: false,
+      action: "uploadFile",
+      error: "FILE_REQUIRED",
+      message: "Missing form field: file"
+    }, 400);
+  }
+
+  const file = maybeFile;
+  const maxSize = getMaxFileSize(env);
+
+  if (file.size > maxSize) {
+    return json({
+      ok: false,
+      action: "uploadFile",
+      error: "FILE_TOO_LARGE",
+      sizeBytes: file.size,
+      maxSizeBytes: maxSize
+    }, 413);
+  }
+
+  const appId = String(
+    form.get("appId") ||
+    request.headers.get("X-SKHPS-App-Id") ||
+    "unknown-app"
+  );
+
+  const envName = String(
+    form.get("env") ||
+    request.headers.get("X-SKHPS-Env") ||
+    "unknown"
+  );
+
+  const bucket = getUploadBucket(env, form);
+  const table = getUploadTable(env);
+  const requestedPath = String(form.get("path") || "");
+  const meta = parseMeta(form.get("meta"));
+
+  const objectPath = makeObjectPath({
+    appId,
+    envName,
+    file,
+    requestedPath
+  });
+
+  const storageResult = await uploadToSupabaseStorage({
+    env,
+    bucket,
+    objectPath,
+    file
+  });
+
+  const record: UploadRecord = {
+    app_id: appId,
+    env: envName,
+    bucket,
+    object_path: objectPath,
+    original_name: getUploadFileName(file),
+    content_type: getUploadFileType(file),
+    size_bytes: file.size || 0,
+    source: "cloudflare-worker",
+    status: "uploaded",
+    meta: {
+      ...meta,
+      storageResult
+    }
+  };
+
+  const inserted = await supabasePost<UploadRecord[]>(env, table, record);
+
+  return json({
+    ok: true,
+    action: "uploadFile",
+    source: "skhps-backend-supabase-storage",
+    bucket,
+    path: objectPath,
+    file: {
+      name: getUploadFileName(file),
+      type: getUploadFileType(file),
+      size: file.size
+    },
+    record: Array.isArray(inserted) ? inserted[0] : inserted
+  });
+}
+
 async function handleAction(request: Request, env: Env): Promise<Response> {
   const body = await readJson(request);
   const action = String(body.action || "");
@@ -247,6 +590,15 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
     }
   }
 
+  if (action === "uploadFile") {
+    return json({
+      ok: false,
+      action,
+      error: "UPLOAD_FILE_REQUIRES_MULTIPART",
+      message: "Use POST /api/upload-file with multipart/form-data. Do not send files through /api/action JSON."
+    }, 400);
+  }
+
   return json({
     ok: false,
     error: "UNKNOWN_ACTION",
@@ -269,15 +621,35 @@ export default {
       return json({
         ok: true,
         service: "skhps-backend",
-        version: "0.1.0",
+        version: "0.1.1-hidden-upload",
         kvBinding: !!env.SKHPS_CACHE,
         hasSupabaseUrl: !!env.SUPABASE_URL,
-        hasSupabaseServiceKey: !!env.SUPABASE_SERVICE_ROLE_KEY
+        hasSupabaseServiceKey: !!env.SUPABASE_SERVICE_ROLE_KEY,
+        upload: {
+          route: "/api/upload-file",
+          bucket: env.SUPABASE_STORAGE_BUCKET || DEFAULT_UPLOAD_BUCKET,
+          table: env.SUPABASE_UPLOAD_TABLE || DEFAULT_UPLOAD_TABLE,
+          maxFileSizeBytes: getMaxFileSize(env),
+          affectsGate: false
+        }
       });
     }
 
     if (url.pathname === "/api/action" && request.method === "POST") {
       return handleAction(request, env);
+    }
+
+    if (url.pathname === "/api/upload-file" && request.method === "POST") {
+      try {
+        return await handleUploadFile(request, env);
+      } catch (error) {
+        return json({
+          ok: false,
+          action: "uploadFile",
+          source: "skhps-backend",
+          error: error instanceof Error ? error.message : String(error)
+        }, 500);
+      }
     }
 
     return json({
