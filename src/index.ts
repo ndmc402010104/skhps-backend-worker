@@ -1,6 +1,6 @@
 /*
  * 檔案位置：skhps-backend-worker/src/index.ts
- * 時間戳記：2026-06-18
+ * 時間戳記：2026-06-19 00:42 UTC+8
  * 用途：SKHPS 新後端 Cloudflare Worker。
  *
  * 目前提供：
@@ -8,6 +8,9 @@
  * - POST /api/action
  *   - ping
  *   - listExternalProjects
+ *   - listExternalProjectsForLauncher
+ *   - registerExternalApp
+ *   - updateExternalProjectActivation / updateExternalAppSettings / setExternalAppActive
  *   - getQuickLoginStaff（讀 Supabase 共用人員主檔 StaffMaster）
  * - POST /api/upload-file
  *
@@ -16,7 +19,9 @@
  * - 不屬於 loading gate。
  * - 不要把 uploadFile 加進 loadingTasks。
  * - Supabase key 只存在 Cloudflare / .dev.vars，不進前端、不進 config.json。
+ * - ExternalProject registry 不使用 KV / cache，每次讀取都直接查 Supabase。
  */
+
 
 export interface Env {
   SUPABASE_URL: string;
@@ -25,39 +30,43 @@ export interface Env {
   SUPABASE_STORAGE_BUCKET?: string;
   SUPABASE_UPLOAD_TABLE?: string;
   SUPABASE_STAFF_TABLE?: string;
+  SUPABASE_EXTERNAL_PROJECT_TABLE?: string;
   MAX_FILE_SIZE_BYTES?: string;
-
-  SKHPS_CACHE: KVNamespace;
 }
 
-type AppEnvironmentRow = {
-  app_id: string;
-  env: string;
-  href: string | null;
-  enabled: boolean;
-  placement: string;
-  sort_order: number;
-  maintenance: boolean;
-  metadata?: Record<string, unknown>;
-};
+type AppEnvName = "local-dev" | "dev" | "prod";
 
-type AppRow = {
-  app_id: string;
+type ExternalProjectRegistryRow = {
+  registry_key: string;
+  project_id: string;
+  root_app_id: string | null;
+  page_id: string | null;
+  env: string;
   title: string;
   description: string | null;
-  group_key: string | null;
-  default_href: string | null;
-  active: boolean;
-};
-
-type AppCardRow = {
-  app_id: string;
-  title: string | null;
-  subtitle: string | null;
-  description: string | null;
-  icon: string | null;
-  badge: string | null;
-  metadata?: Record<string, unknown>;
+  href: string;
+  display_position: string | null;
+  group_name: string | null;
+  sort_order: number | null;
+  enabled: boolean;
+  show_on_home: boolean | null;
+  show_on_backend: boolean | null;
+  version: string | null;
+  version_raw: string | null;
+  manifest_url: string | null;
+  register_external_app: boolean | null;
+  backend_required: boolean | null;
+  features_css_runtime: boolean | null;
+  features_header: boolean | null;
+  features_footer: boolean | null;
+  features_runtime_panel: boolean | null;
+  features_backend_client: boolean | null;
+  last_report_at: string | null;
+  report_count: number | null;
+  source: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  notes: string | null;
 };
 
 type StaffMasterRow = Record<string, unknown>;
@@ -88,6 +97,7 @@ type WorkerUploadFile = Blob & {
 const DEFAULT_UPLOAD_BUCKET = "skhps-uploads";
 const DEFAULT_UPLOAD_TABLE = "skhps_file_uploads";
 const DEFAULT_STAFF_TABLE = "StaffMaster";
+const DEFAULT_EXTERNAL_PROJECT_TABLE = "ExternalProject";
 const DEFAULT_MAX_FILE_SIZE_BYTES = 6 * 1024 * 1024;
 
 function corsHeaders(): HeadersInit {
@@ -183,9 +193,181 @@ async function supabasePost<T>(
   }
 }
 
-function normalizeEnv(input: unknown): "local" | "dev" | "prod" {
-  const value = String(input || "prod").toLowerCase();
-  if (value === "local" || value === "dev" || value === "prod") return value;
+
+async function supabasePatch<T>(
+  env: Env,
+  table: string,
+  query: string,
+  patch: Record<string, unknown>
+): Promise<T> {
+  const baseUrl = getSupabaseBaseUrl(env);
+  const safeTable = table.replace(/^\/+/, "");
+  const safeQuery = query.replace(/^\?+/, "");
+
+  const response = await fetch(`${baseUrl}/rest/v1/${safeTable}?${safeQuery}`, {
+    method: "PATCH",
+    headers: {
+      ...getSupabaseHeaders(env),
+      "Prefer": "return=representation"
+    },
+    body: JSON.stringify(patch)
+  });
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`SUPABASE_PATCH_FAILED ${response.status} ${text}`);
+  }
+
+  try {
+    return text ? JSON.parse(text) as T : ([] as T);
+  } catch {
+    return [{ raw: text }] as T;
+  }
+}
+
+async function supabaseUpsert<T>(
+  env: Env,
+  table: string,
+  records: Record<string, unknown> | Record<string, unknown>[],
+  onConflict: string
+): Promise<T> {
+  const baseUrl = getSupabaseBaseUrl(env);
+  const safeTable = table.replace(/^\/+/, "");
+  const path = `${safeTable}?on_conflict=${encodeURIComponent(onConflict)}`;
+
+  const response = await fetch(`${baseUrl}/rest/v1/${path}`, {
+    method: "POST",
+    headers: {
+      ...getSupabaseHeaders(env),
+      "Prefer": "resolution=merge-duplicates,return=representation"
+    },
+    body: JSON.stringify(records)
+  });
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`SUPABASE_UPSERT_FAILED ${response.status} ${text}`);
+  }
+
+  try {
+    return text ? JSON.parse(text) as T : ([] as T);
+  } catch {
+    return [{ raw: text }] as T;
+  }
+}
+
+function normalizeVersionValue(value: unknown): string {
+  if (value === undefined || value === null) return "";
+
+  if (typeof value === "object") {
+    const objectValue = value as Record<string, unknown>;
+    return String(
+      objectValue.version ||
+      objectValue.appVersion ||
+      objectValue.buildVersion ||
+      objectValue.buildTime ||
+      ""
+    ).trim();
+  }
+
+  const text = String(value || "").trim();
+  return text === "[object Object]" ? "" : text;
+}
+
+function normalizePlacement(input: unknown): "frontend" | "backend" | "hidden" {
+  const value = String(input || "").trim().toLowerCase();
+
+  if (input === "前台" || value === "front" || value === "frontend") return "frontend";
+  if (input === "後台" || value === "back" || value === "backend" || value === "admin") return "backend";
+  return "hidden";
+}
+
+function placementLabel(input: unknown): "" | "前台" | "後台" {
+  const placement = normalizePlacement(input);
+  if (placement === "frontend") return "前台";
+  if (placement === "backend") return "後台";
+  return "";
+}
+
+function booleanFromUnknown(input: unknown): boolean {
+  if (input === true || input === 1) return true;
+  const text = String(input || "").trim().toLowerCase();
+  return text === "true" || text === "1" || text === "yes" || text === "y" || text === "on" || text === "啟用" || text === "是";
+}
+
+function numberFromUnknown(input: unknown, fallback: number): number {
+  const n = Number(input);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function firstText(...values: unknown[]): string {
+  for (const value of values) {
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      return String(value).trim();
+    }
+  }
+
+  return "";
+}
+
+function normalizeRegistryPayload(body: any): Record<string, unknown> {
+  const payload = body && body.payload && typeof body.payload === "object" ? body.payload : body || {};
+  return payload as Record<string, unknown>;
+}
+
+function normalizeExternalAppRegisterPayload(input: Record<string, unknown>): {
+  appId: string;
+  rootAppId: string;
+  env: AppEnvName;
+  title: string;
+  href: string;
+  group: string;
+  version: string;
+  description: string;
+  pageId: string;
+  pageTitle: string;
+  pageHref: string;
+} {
+  const config = input.config && typeof input.config === "object" ? input.config as Record<string, unknown> : input;
+  const appId = firstText(config.appId, config.id, input.appId, input.rootAppId, input.projectId, input.id);
+  const rootAppId = firstText(input.rootAppId, config.rootAppId, appId);
+  const envName = normalizeEnv(firstText(config.env, input.env, input.runtime, input.requestedRuntime));
+  const title = firstText(config.title, config.name, input.title, appId);
+  const href = firstText(config.href, config.url, input.href, input.url, input.pageUrl);
+  const group = firstText(config.group, config.category, input.group, input.category);
+  const version = normalizeVersionValue(config.version || input.version);
+  const description = firstText(config.description, input.description);
+  const pageId = firstText(input.pageId, config.pageId, appId);
+  const pageTitle = firstText(input.pageTitle, config.pageTitle, title);
+  const pageHref = firstText(input.pageHref, config.pageHref, href);
+
+  return {
+    appId,
+    rootAppId,
+    env: envName,
+    title,
+    href,
+    group,
+    version,
+    description,
+    pageId,
+    pageTitle,
+    pageHref
+  };
+}
+
+function normalizeEnv(input: unknown): AppEnvName {
+  const value = String(input || "prod").trim().toLowerCase();
+
+  if (value === "local-dev" || value === "local" || value === "localhost") {
+    return "local-dev";
+  }
+
+  if (value === "dev") return "dev";
+  if (value === "prod" || value === "production") return "prod";
+
   return "prod";
 }
 
@@ -340,108 +522,472 @@ async function uploadToSupabaseStorage(input: {
   }
 }
 
-async function listExternalProjects(env: Env, appEnv: "local" | "dev" | "prod") {
-  const cacheKey = `external-apps:${appEnv}:v1`;
+function getExternalProjectTable(_env?: Env): string {
+  /*
+   * 固定使用 Supabase 目前實際建立的單表名稱：ExternalProject。
+   * 不再讀 SUPABASE_EXTERNAL_PROJECT_TABLE，避免 Cloudflare secret / 舊環境變數
+   * 把 table name 蓋回 external_project_registry，造成 PGRST205 404。
+   */
+  return DEFAULT_EXTERNAL_PROJECT_TABLE;
+}
 
-  try {
-    const cached = await env.SKHPS_CACHE.get(cacheKey);
-    if (cached) {
-      const parsed = JSON.parse(cached);
-      return {
-        ...parsed,
-        source: "skhps-backend-kv"
-      };
-    }
-  } catch {
-    // cache 失敗不擋主流程
+function makeRegistryKey(projectId: unknown, appEnv: unknown): string {
+  return `${String(projectId || "").trim()}__${normalizeEnv(appEnv)}`;
+}
+
+function projectIdFromRegisterPayload(payload: ReturnType<typeof normalizeExternalAppRegisterPayload>): string {
+  const rootAppId = firstText(payload.rootAppId, payload.appId);
+  const pageId = firstText(payload.pageId, rootAppId);
+
+  if (pageId && pageId !== rootAppId) {
+    return pageId;
   }
 
-  const environments = await supabaseGet<AppEnvironmentRow[]>(
-    env,
-    `app_environments?env=eq.${encodeURIComponent(appEnv)}&enabled=eq.true&placement=neq.hidden&order=sort_order.asc`
-  );
+  return rootAppId;
+}
 
-  const apps = await supabaseGet<AppRow[]>(
-    env,
-    "apps?active=eq.true"
-  );
+function rootAppIdFromRegisterPayload(payload: ReturnType<typeof normalizeExternalAppRegisterPayload>): string {
+  return firstText(payload.rootAppId, payload.appId, payload.pageId);
+}
 
-  const cards = await supabaseGet<AppCardRow[]>(
-    env,
-    "app_cards"
-  );
+function pageIdFromRegisterPayload(payload: ReturnType<typeof normalizeExternalAppRegisterPayload>, projectId: string): string {
+  return firstText(payload.pageId, projectId);
+}
 
-  const appMap = new Map(apps.map((row) => [row.app_id, row]));
-  const cardMap = new Map(cards.map((row) => [row.app_id, row]));
+function inferManifestUrl(href: string): string {
+  if (!href) return "";
 
-  const items = environments
-    .map((row) => {
-      const app = appMap.get(row.app_id);
-      const card = cardMap.get(row.app_id);
+  try {
+    const url = new URL(href);
+    const path = url.pathname || "/";
 
-      if (!app) return null;
+    if (path.toLowerCase().endsWith(".html")) {
+      url.pathname = path.replace(/\/[^/]*$/, "/app.json");
+    } else if (path.endsWith("/")) {
+      url.pathname = path + "app.json";
+    } else {
+      url.pathname = path + "/app.json";
+    }
 
-      const title = card?.title || app.title;
-      const description = card?.description || app.description || "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    const base = String(href || "").split("?")[0].split("#")[0];
+    if (base.toLowerCase().endsWith(".html")) {
+      return base.replace(/\/[^/]*$/, "/app.json");
+    }
+    return base.replace(/\/+$/, "") + "/app.json";
+  }
+}
 
-      return {
-        appId: row.app_id,
-        app_id: row.app_id,
+function normalizeRegistryRow(row: ExternalProjectRegistryRow): Record<string, unknown> {
+  const projectId = firstText(row.project_id, row.registry_key && String(row.registry_key).split("__")[0]);
+  const rootAppId = firstText(row.root_app_id, projectId);
+  const pageId = firstText(row.page_id, projectId);
+  const displayPosition = placementLabel(row.display_position);
+  const enabled = booleanFromUnknown(row.enabled);
+  const sortOrder = numberFromUnknown(row.sort_order, 9999);
+  const reportCount = numberFromUnknown(row.report_count, 0);
+  const groupName = firstText(row.group_name, "院內系統");
+  const version = normalizeVersionValue(row.version);
+  const versionRaw = firstText(row.version_raw);
 
-        title,
-        name: title,
-        appName: title,
+  return {
+    registryKey: row.registry_key,
+    registry_key: row.registry_key,
 
-        subtitle: card?.subtitle || "",
-        description,
+    projectId,
+    project_id: projectId,
+    appId: projectId,
+    app_id: projectId,
+    rootAppId,
+    root_app_id: rootAppId,
+    pageId,
+    page_id: pageId,
 
-        group: app.group_key || "frontend",
-        groupKey: app.group_key || "frontend",
+    title: firstText(row.title, projectId),
+    name: firstText(row.title, projectId),
+    appName: firstText(row.title, projectId),
+    description: firstText(row.description),
+    href: firstText(row.href),
+    url: firstText(row.href),
+    env: normalizeEnv(row.env),
 
-        href: row.href || app.default_href || "",
-        url: row.href || app.default_href || "",
+    enabled,
+    active: enabled,
+    displayPosition,
+    "顯示位置": displayPosition,
+    placement: normalizePlacement(row.display_position),
+    location: normalizePlacement(row.display_position),
+    group: groupName,
+    groupKey: groupName,
+    group_key: groupName,
+    groupName,
+    group_name: groupName,
 
-        env: row.env,
-        enabled: row.enabled,
-        active: app.active,
-        placement: row.placement,
-        sortOrder: row.sort_order,
-        sort_order: row.sort_order,
-        maintenance: row.maintenance,
+    sortOrder,
+    sort_order: sortOrder,
+    order: sortOrder,
+    sort: sortOrder,
 
-        icon: card?.icon || "",
-        badge: card?.badge || "",
+    showOnHome: booleanFromUnknown(row.show_on_home),
+    show_on_home: booleanFromUnknown(row.show_on_home),
+    showOnBackend: booleanFromUnknown(row.show_on_backend),
+    show_on_backend: booleanFromUnknown(row.show_on_backend),
 
-        metadata: {
-          app: app,
-          environment: row.metadata || {},
-          card: card?.metadata || {}
-        }
-      };
-    })
-    .filter(Boolean);
+    version,
+    versionRaw,
+    version_raw: versionRaw,
+    manifestUrl: firstText(row.manifest_url),
+    manifest_url: firstText(row.manifest_url),
+    registerExternalApp: booleanFromUnknown(row.register_external_app),
+    register_external_app: booleanFromUnknown(row.register_external_app),
+    backendRequired: booleanFromUnknown(row.backend_required),
+    backend_required: booleanFromUnknown(row.backend_required),
 
-  const payload = {
+    lastReportAt: firstText(row.last_report_at),
+    lastSeenAt: firstText(row.last_report_at),
+    last_report_at: firstText(row.last_report_at),
+    reportCount,
+    registerCount: reportCount,
+    report_count: reportCount,
+
+    source: firstText(row.source, "supabase"),
+    createdAt: firstText(row.created_at),
+    created_at: firstText(row.created_at),
+    updatedAt: firstText(row.updated_at),
+    updated_at: firstText(row.updated_at),
+    notes: firstText(row.notes),
+
+    metadata: {
+      registryTable: DEFAULT_EXTERNAL_PROJECT_TABLE,
+      versionRaw,
+      features: {
+        cssRuntime: booleanFromUnknown(row.features_css_runtime),
+        header: booleanFromUnknown(row.features_header),
+        footer: booleanFromUnknown(row.features_footer),
+        runtimePanel: booleanFromUnknown(row.features_runtime_panel),
+        backendClient: booleanFromUnknown(row.features_backend_client)
+      },
+      source: firstText(row.source, "supabase")
+    }
+  };
+}
+
+async function deleteRegistryCache(env: Env, appEnv: AppEnvName): Promise<void> {
+  /*
+   * ExternalProject registry 不使用 KV / cache。
+   * 保留此函式是為了讓 register/update 流程維持最小修改；這裡故意 no-op。
+   */
+  void env;
+  void appEnv;
+}
+
+async function listExternalProjects(
+  env: Env,
+  appEnv: AppEnvName,
+  options: { activeOnly?: boolean; bypassCache?: boolean } = {}
+) {
+  /*
+   * 重要：ExternalProject registry 是管理資料，不使用 KV / cache。
+   * 首頁與後台都必須讀 Supabase 當下最新資料；後台停用項目也不能被快取吃掉。
+   */
+  const activeOnly = options.activeOnly !== false;
+  void options.bypassCache;
+
+  const table = getExternalProjectTable(env);
+  let path = `${encodeURIComponent(table)}?env=eq.${encodeURIComponent(appEnv)}&select=*&order=sort_order.asc.nullslast,title.asc`;
+
+  if (activeOnly) {
+    path += "&enabled=eq.true&display_position=neq.hidden";
+  }
+
+  const rows = await supabaseGet<ExternalProjectRegistryRow[]>(env, path);
+  const items = rows.map(normalizeRegistryRow);
+
+  return {
     ok: true,
     action: "listExternalProjects",
     source: "skhps-backend-supabase",
+    sourceLabel: "Supabase ExternalProject / Cloudflare Worker",
+    registryTable: table,
     env: appEnv,
     count: items.length,
-    cachedAt: new Date().toISOString(),
-    items
+    fetchedAt: new Date().toISOString(),
+    items,
+    apps: items,
+    projects: items
   };
-
-  try {
-    await env.SKHPS_CACHE.put(cacheKey, JSON.stringify(payload), {
-      expirationTtl: 60
-    });
-  } catch {
-    // cache 寫入失敗不擋 response
-  }
-
-  return payload;
 }
 
+async function registerExternalApp(env: Env, body: any) {
+  const payload = normalizeExternalAppRegisterPayload(normalizeRegistryPayload(body));
+  const rootAppId = rootAppIdFromRegisterPayload(payload);
+  const projectId = projectIdFromRegisterPayload(payload);
+  const pageId = pageIdFromRegisterPayload(payload, projectId);
+  const appEnv = normalizeEnv(payload.env);
+  const registryKey = makeRegistryKey(projectId, appEnv);
+  const table = getExternalProjectTable(env);
+
+  if (!projectId) {
+    return {
+      ok: false,
+      action: "registerExternalApp",
+      source: "skhps-backend-supabase",
+      error: "MISSING_PROJECT_ID",
+      message: "缺少 project_id / appId"
+    };
+  }
+
+  const href = firstText(
+    pageId && pageId !== rootAppId ? payload.pageHref : "",
+    payload.href
+  );
+
+  if (!href) {
+    return {
+      ok: false,
+      action: "registerExternalApp",
+      source: "skhps-backend-supabase",
+      error: "MISSING_HREF",
+      message: "缺少入口網址"
+    };
+  }
+
+  const existingRows = await supabaseGet<ExternalProjectRegistryRow[]>(
+    env,
+    `${encodeURIComponent(table)}?registry_key=eq.${encodeURIComponent(registryKey)}&select=*`
+  );
+
+  const existing = existingRows[0] || null;
+  const now = new Date().toISOString();
+  const version = normalizeVersionValue(payload.version);
+  const title = firstText(
+    pageId && pageId !== rootAppId ? payload.pageTitle : "",
+    payload.title,
+    existing && existing.title,
+    projectId
+  );
+
+  const record: Record<string, unknown> = {
+    registry_key: registryKey,
+    project_id: projectId,
+    root_app_id: rootAppId || projectId,
+    page_id: pageId || projectId,
+    env: appEnv,
+    title,
+    description: firstText(payload.description, existing && existing.description),
+    href,
+    display_position: existing ? normalizePlacement(existing.display_position) : "hidden",
+    group_name: firstText(existing && existing.group_name, payload.group, "院內系統"),
+    sort_order: existing ? numberFromUnknown(existing.sort_order, 9999) : 9999,
+    enabled: existing ? booleanFromUnknown(existing.enabled) : false,
+    show_on_home: existing ? booleanFromUnknown(existing.enabled) && normalizePlacement(existing.display_position) === "frontend" : false,
+    show_on_backend: existing ? booleanFromUnknown(existing.enabled) && normalizePlacement(existing.display_position) === "backend" : false,
+    version: version || existing && existing.version || "",
+    version_raw: version ? "" : firstText(existing && existing.version_raw),
+    manifest_url: firstText(existing && existing.manifest_url, inferManifestUrl(href)),
+    register_external_app: true,
+    backend_required: existing ? booleanFromUnknown(existing.backend_required) : false,
+    features_css_runtime: existing ? booleanFromUnknown(existing.features_css_runtime) : true,
+    features_header: existing ? booleanFromUnknown(existing.features_header) : true,
+    features_footer: existing ? booleanFromUnknown(existing.features_footer) : true,
+    features_runtime_panel: existing ? booleanFromUnknown(existing.features_runtime_panel) : true,
+    features_backend_client: existing ? booleanFromUnknown(existing.features_backend_client) : false,
+    last_report_at: now,
+    report_count: existing ? numberFromUnknown(existing.report_count, 0) + 1 : 1,
+    source: "registerExternalApp",
+    created_at: existing && existing.created_at ? existing.created_at : now,
+    updated_at: now,
+    notes: existing && existing.notes ? existing.notes : ""
+  };
+
+  const updated = await supabaseUpsert<ExternalProjectRegistryRow[]>(
+    env,
+    table,
+    record,
+    "registry_key"
+  );
+
+  await deleteRegistryCache(env, appEnv);
+
+  const normalized = normalizeRegistryRow((Array.isArray(updated) && updated[0] ? updated[0] : record) as ExternalProjectRegistryRow);
+
+  return {
+    ok: true,
+    action: "registerExternalApp",
+    source: "skhps-backend-supabase",
+    sourceLabel: "Supabase ExternalProject / Cloudflare Worker",
+    status: existing ? "updated" : "created",
+    registryTable: table,
+    registryKey,
+    appId: projectId,
+    projectId,
+    rootAppId,
+    pageId,
+    env: appEnv,
+    active: normalized.enabled,
+    enabled: normalized.enabled,
+    data: normalized,
+    message: existing
+      ? "外部專案已存在，已更新 Supabase 報到資訊，啟用狀態維持不變"
+      : "外部專案第一次報到，已建立為未啟用"
+  };
+}
+
+async function updateExternalProjectActivation(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const projectId = firstText(payload.projectId, payload.appId, payload.app_id, payload["專案ID"]);
+  const appEnv = normalizeEnv(firstText(payload.env, payload["環境"]));
+  const registryKey = firstText(payload.registryKey, payload.registry_key, makeRegistryKey(projectId, appEnv));
+  const table = getExternalProjectTable(env);
+
+  if (!projectId && !registryKey) {
+    return {
+      ok: false,
+      action: "updateExternalProjectActivation",
+      source: "skhps-backend-supabase",
+      error: "MISSING_PROJECT_ID",
+      message: "缺少 projectId / registryKey"
+    };
+  }
+
+  const existing = await supabaseGet<ExternalProjectRegistryRow[]>(
+    env,
+    `${encodeURIComponent(table)}?registry_key=eq.${encodeURIComponent(registryKey)}&select=*`
+  );
+
+  if (!existing.length) {
+    return {
+      ok: false,
+      action: "updateExternalProjectActivation",
+      source: "skhps-backend-supabase",
+      error: "PROJECT_NOT_FOUND",
+      message: `找不到外部專案：${projectId || registryKey} / ${appEnv}`,
+      projectId,
+      registryKey,
+      env: appEnv
+    };
+  }
+
+  const row = existing[0];
+  const patch: Record<string, unknown> = {};
+  const hasEnabled = Object.prototype.hasOwnProperty.call(payload, "enabled") ||
+    Object.prototype.hasOwnProperty.call(payload, "active") ||
+    Object.prototype.hasOwnProperty.call(payload, "啟用");
+  const hasDisplayPosition = Object.prototype.hasOwnProperty.call(payload, "displayPosition") ||
+    Object.prototype.hasOwnProperty.call(payload, "position") ||
+    Object.prototype.hasOwnProperty.call(payload, "placement") ||
+    Object.prototype.hasOwnProperty.call(payload, "display_position") ||
+    Object.prototype.hasOwnProperty.call(payload, "顯示位置");
+  const hasSort = Object.prototype.hasOwnProperty.call(payload, "sort") ||
+    Object.prototype.hasOwnProperty.call(payload, "order") ||
+    Object.prototype.hasOwnProperty.call(payload, "sortOrder") ||
+    Object.prototype.hasOwnProperty.call(payload, "sort_order") ||
+    Object.prototype.hasOwnProperty.call(payload, "排序");
+
+  if (hasEnabled) {
+    patch.enabled = booleanFromUnknown(
+      Object.prototype.hasOwnProperty.call(payload, "enabled") ? payload.enabled :
+        Object.prototype.hasOwnProperty.call(payload, "active") ? payload.active :
+          payload["啟用"]
+    );
+  }
+
+  if (hasDisplayPosition) {
+    const requestedPosition = firstText(
+      payload.displayPosition,
+      payload.position,
+      payload.placement,
+      payload.display_position,
+      payload["顯示位置"]
+    );
+
+    /*
+     * 停用不是刪除。
+     * 停用時如果沒有顯示位置，就保留 Supabase 既有 display_position，避免變 hidden 後像被丟進垃圾桶。
+     */
+    if (requestedPosition) {
+      patch.display_position = normalizePlacement(requestedPosition);
+    } else if (!(hasEnabled && patch.enabled === false)) {
+      patch.display_position = "hidden";
+    }
+  }
+
+  if (hasSort) {
+    patch.sort_order = numberFromUnknown(payload.sort || payload.order || payload.sortOrder || payload.sort_order || payload["排序"], row.sort_order || 9999);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, "group") || Object.prototype.hasOwnProperty.call(payload, "groupName") || Object.prototype.hasOwnProperty.call(payload, "group_name")) {
+    patch.group_name = firstText(payload.group, payload.groupName, payload.group_name, row.group_name);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, "title")) {
+    patch.title = firstText(payload.title, row.title);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, "href")) {
+    patch.href = firstText(payload.href, row.href);
+  }
+
+  if (!Object.keys(patch).length) {
+    return {
+      ok: false,
+      action: "updateExternalProjectActivation",
+      source: "skhps-backend-supabase",
+      error: "NO_UPDATABLE_FIELDS",
+      message: "沒有可更新的欄位"
+    };
+  }
+
+  const nextEnabled = Object.prototype.hasOwnProperty.call(patch, "enabled") ? booleanFromUnknown(patch.enabled) : booleanFromUnknown(row.enabled);
+  const nextPosition = Object.prototype.hasOwnProperty.call(patch, "display_position") ? normalizePlacement(patch.display_position) : normalizePlacement(row.display_position);
+
+  patch.show_on_home = nextEnabled && nextPosition === "frontend";
+  patch.show_on_backend = nextEnabled && nextPosition === "backend";
+  patch.updated_at = new Date().toISOString();
+  patch.source = "backend-project-launcher";
+
+  const updated = await supabasePatch<ExternalProjectRegistryRow[]>(
+    env,
+    table,
+    `registry_key=eq.${encodeURIComponent(registryKey)}`,
+    patch
+  );
+
+  await deleteRegistryCache(env, appEnv);
+
+  const next = updated[0] || {
+    ...row,
+    ...patch
+  } as ExternalProjectRegistryRow;
+  const normalized = normalizeRegistryRow(next);
+
+  return {
+    ok: true,
+    action: "updateExternalProjectActivation",
+    source: "skhps-backend-supabase",
+    sourceLabel: "Supabase ExternalProject / Cloudflare Worker",
+    registryTable: table,
+    registryKey,
+    appId: normalized.appId,
+    projectId: normalized.projectId,
+    rootAppId: normalized.rootAppId,
+    pageId: normalized.pageId,
+    env: appEnv,
+    active: normalized.enabled,
+    enabled: normalized.enabled,
+    displayPosition: normalized.displayPosition,
+    order: normalized.sortOrder,
+    sort: normalized.sortOrder,
+    data: {
+      ...normalized,
+      updatedFields: Object.keys(patch)
+    },
+    message: "已更新 Supabase ExternalProject 設定"
+  };
+}
 
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -571,22 +1117,10 @@ function getStaffTable(env: Env): string {
   return String(env.SUPABASE_STAFF_TABLE || DEFAULT_STAFF_TABLE).trim() || DEFAULT_STAFF_TABLE;
 }
 
-async function getQuickLoginStaff(env: Env, appEnv: "local" | "dev" | "prod") {
+async function getQuickLoginStaff(env: Env, appEnv: AppEnvName) {
   const tableName = getStaffTable(env);
-  const cacheKey = `quick-login-staff:${tableName}:${appEnv}:v2`;
-
-  try {
-    const cached = await env.SKHPS_CACHE.get(cacheKey);
-    if (cached) {
-      const parsed = JSON.parse(cached);
-      return {
-        ...parsed,
-        source: "skhps-backend-kv"
-      };
-    }
-  } catch {
-    // cache 失敗不擋主流程
-  }
+  /* StaffMaster 也不從 KV 回傳；保留 appEnv 只作診斷。 */
+  void appEnv;
 
   const rows = await supabaseGet<StaffMasterRow[]>(
     env,
@@ -614,13 +1148,6 @@ async function getQuickLoginStaff(env: Env, appEnv: "local" | "dev" | "prod") {
     extraList: []
   };
 
-  try {
-    await env.SKHPS_CACHE.put(cacheKey, JSON.stringify(payload), {
-      expirationTtl: 60
-    });
-  } catch {
-    // cache 寫入失敗不擋 response
-  }
 
   return payload;
 }
@@ -742,32 +1269,77 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
   }
 
   if (action === "ping") {
-    let kvOk = false;
-
-    try {
-      await env.SKHPS_CACHE.put("health:ping", new Date().toISOString());
-      const value = await env.SKHPS_CACHE.get("health:ping");
-      kvOk = !!value;
-    } catch {
-      kvOk = false;
-    }
 
     return json({
       ok: true,
       action: "ping",
       source: "skhps-backend",
       env: body.env || null,
-      kvOk,
       hasSupabaseUrl: !!env.SUPABASE_URL,
       hasSupabaseServiceKey: !!env.SUPABASE_SERVICE_ROLE_KEY
     });
   }
 
-  if (action === "listExternalProjects") {
+  if (action === "listExternalProjects" || action === "listExternalApps" || action === "listExternalProjectsForLauncher") {
     try {
-      const appEnv = normalizeEnv(body.env || body.payload?.env);
-      const result = await listExternalProjects(env, appEnv);
-      return json(result);
+      const payload = normalizeRegistryPayload(body);
+      const appEnv = normalizeEnv(body.env || payload.env);
+      const isLauncherAction = action === "listExternalProjectsForLauncher";
+      const includeDisabled =
+        isLauncherAction ||
+        booleanFromUnknown(payload.includeDisabled) ||
+        booleanFromUnknown(payload.includeInactive) ||
+        booleanFromUnknown(payload.launcherMode) ||
+        String(payload.activeOnly || "").trim().toLowerCase() === "false";
+      const result = await listExternalProjects(env, appEnv, {
+        activeOnly: includeDisabled ? false : true,
+        bypassCache: isLauncherAction || booleanFromUnknown(payload.forceFresh)
+      });
+      return json({
+        ...result,
+        action
+      });
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "registerExternalApp") {
+    try {
+      const result = await registerExternalApp(env, body);
+      return json(result.ok === false ? result : {
+        ...result,
+        action
+      }, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (
+    action === "updateExternalProjectActivation" ||
+    action === "updateExternalAppSettings" ||
+    action === "setExternalAppActive"
+  ) {
+    try {
+      const result = await updateExternalProjectActivation(env, body);
+      return json(result.ok === false ? {
+        ...result,
+        action
+      } : {
+        ...result,
+        action
+      }, result.ok === false ? 400 : 200);
     } catch (error) {
       return json({
         ok: false,
@@ -825,7 +1397,6 @@ export default {
         ok: true,
         service: "skhps-backend",
         version: "0.1.2-hidden-upload-staff-race",
-        kvBinding: !!env.SKHPS_CACHE,
         hasSupabaseUrl: !!env.SUPABASE_URL,
         hasSupabaseServiceKey: !!env.SUPABASE_SERVICE_ROLE_KEY,
         upload: {
