@@ -8,6 +8,7 @@
  * - POST /api/action
  *   - ping
  *   - listExternalProjects
+ *   - getQuickLoginStaff（讀 Supabase 共用人員主檔 StaffMaster）
  * - POST /api/upload-file
  *
  * 原則：
@@ -23,6 +24,7 @@ export interface Env {
 
   SUPABASE_STORAGE_BUCKET?: string;
   SUPABASE_UPLOAD_TABLE?: string;
+  SUPABASE_STAFF_TABLE?: string;
   MAX_FILE_SIZE_BYTES?: string;
 
   SKHPS_CACHE: KVNamespace;
@@ -58,6 +60,8 @@ type AppCardRow = {
   metadata?: Record<string, unknown>;
 };
 
+type StaffMasterRow = Record<string, unknown>;
+
 type UploadRecord = {
   app_id: string;
   env: string;
@@ -83,6 +87,7 @@ type WorkerUploadFile = Blob & {
 
 const DEFAULT_UPLOAD_BUCKET = "skhps-uploads";
 const DEFAULT_UPLOAD_TABLE = "skhps_file_uploads";
+const DEFAULT_STAFF_TABLE = "StaffMaster";
 const DEFAULT_MAX_FILE_SIZE_BYTES = 6 * 1024 * 1024;
 
 function corsHeaders(): HeadersInit {
@@ -437,6 +442,189 @@ async function listExternalProjects(env: Env, appEnv: "local" | "dev" | "prod") 
   return payload;
 }
 
+
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function firstValue(row: StaffMasterRow, keys: string[]): unknown {
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(row, key)) {
+      const value = row[key];
+      if (value !== undefined && value !== null && String(value).trim() !== "") {
+        return value;
+      }
+    }
+  }
+
+  return null;
+}
+
+function stringValue(row: StaffMasterRow, keys: string[], fallback = ""): string {
+  const value = firstValue(row, keys);
+  if (value === undefined || value === null) return fallback;
+  return String(value).trim();
+}
+
+function numberValue(row: StaffMasterRow, keys: string[], fallback = 999): number {
+  const value = firstValue(row, keys);
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return number;
+}
+
+function booleanValue(row: StaffMasterRow, keys: string[], fallback = true): boolean {
+  const value = firstValue(row, keys);
+
+  if (value === undefined || value === null) return fallback;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+
+  const text = String(value).trim().toLowerCase();
+  if (["true", "t", "1", "yes", "y", "是", "啟用", "允許"].includes(text)) return true;
+  if (["false", "f", "0", "no", "n", "否", "停用", "不允許"].includes(text)) return false;
+
+  return fallback;
+}
+
+function rowMetadata(row: StaffMasterRow): Record<string, unknown> {
+  const raw = row.metadata || row.Metadata || row["metadata"];
+  if (isPlainObject(raw)) return raw;
+  return {};
+}
+
+function metadataString(row: StaffMasterRow, metadata: Record<string, unknown>, keys: string[], fallback = ""): string {
+  const direct = stringValue(row, keys, "");
+  if (direct) return direct;
+
+  for (const key of keys) {
+    const value = metadata[key];
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      return String(value).trim();
+    }
+  }
+
+  return fallback;
+}
+
+function metadataBoolean(row: StaffMasterRow, metadata: Record<string, unknown>, keys: string[], fallback = true): boolean {
+  const direct = firstValue(row, keys);
+  if (direct !== undefined && direct !== null && String(direct).trim() !== "") {
+    return booleanValue(row, keys, fallback);
+  }
+
+  for (const key of keys) {
+    const value = metadata[key];
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      if (typeof value === "boolean") return value;
+      if (typeof value === "number") return value !== 0;
+      const text = String(value).trim().toLowerCase();
+      if (["true", "t", "1", "yes", "y", "是", "啟用", "允許"].includes(text)) return true;
+      if (["false", "f", "0", "no", "n", "否", "停用", "不允許"].includes(text)) return false;
+    }
+  }
+
+  return fallback;
+}
+
+function toQuickLoginPerson(row: StaffMasterRow, tableName: string) {
+  const metadata = rowMetadata(row);
+
+  const name = stringValue(row, ["姓名", "display_name", "name", "Name"]);
+  const emp = stringValue(row, ["員工編號", "staff_code", "emp", "employee_id", "staff_id"]);
+  const role = metadataString(row, metadata, ["職級", "role", "title"], "");
+  const group = metadataString(row, metadata, ["分組", "group_key", "group"], "");
+  const note = metadataString(row, metadata, ["備註", "note"], "");
+  const sortOrder = numberValue(row, ["排序", "sort_order", "sortOrder"], 999);
+  const updatedAt = stringValue(row, ["更新時間", "updated_at", "updatedAt"], "");
+
+  const active = booleanValue(row, ["啟用", "active", "enabled"], true);
+  const allowQuickLogin = metadataBoolean(row, metadata, ["允許快速登入", "allow_quick_login", "allowQuickLogin"], true);
+
+  return {
+    id: emp,
+    name,
+    emp,
+    role,
+    title: role,
+    group,
+    sortOrder,
+    sort_order: sortOrder,
+    active,
+    enabled: active,
+    allowQuickLogin,
+    allow_quick_login: allowQuickLogin,
+    note,
+    updatedAt,
+    metadata: {
+      ...metadata,
+      staffTable: tableName,
+      group_key: group,
+      note
+    },
+    source: "supabase"
+  };
+}
+
+function getStaffTable(env: Env): string {
+  return String(env.SUPABASE_STAFF_TABLE || DEFAULT_STAFF_TABLE).trim() || DEFAULT_STAFF_TABLE;
+}
+
+async function getQuickLoginStaff(env: Env, appEnv: "local" | "dev" | "prod") {
+  const tableName = getStaffTable(env);
+  const cacheKey = `quick-login-staff:${tableName}:${appEnv}:v2`;
+
+  try {
+    const cached = await env.SKHPS_CACHE.get(cacheKey);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      return {
+        ...parsed,
+        source: "skhps-backend-kv"
+      };
+    }
+  } catch {
+    // cache 失敗不擋主流程
+  }
+
+  const rows = await supabaseGet<StaffMasterRow[]>(
+    env,
+    `${encodeURIComponent(tableName)}?select=*`
+  );
+
+  const staffList = rows
+    .map((row) => toQuickLoginPerson(row, tableName))
+    .filter((person) => person.active && person.allowQuickLogin && person.name && person.emp)
+    .sort((a, b) => {
+      const orderDiff = Number(a.sortOrder || 999) - Number(b.sortOrder || 999);
+      if (orderDiff !== 0) return orderDiff;
+      return String(a.emp || "").localeCompare(String(b.emp || ""));
+    });
+
+  const payload = {
+    ok: true,
+    action: "getQuickLoginStaff",
+    source: "skhps-backend-supabase",
+    env: appEnv,
+    staffTable: tableName,
+    count: staffList.length,
+    cachedAt: new Date().toISOString(),
+    staffList,
+    extraList: []
+  };
+
+  try {
+    await env.SKHPS_CACHE.put(cacheKey, JSON.stringify(payload), {
+      expirationTtl: 60
+    });
+  } catch {
+    // cache 寫入失敗不擋 response
+  }
+
+  return payload;
+}
+
 async function handleUploadFile(request: Request, env: Env): Promise<Response> {
   const contentType =
     request.headers.get("Content-Type") ||
@@ -590,6 +778,21 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
     }
   }
 
+  if (action === "getQuickLoginStaff") {
+    try {
+      const appEnv = normalizeEnv(body.env || body.payload?.env);
+      const result = await getQuickLoginStaff(env, appEnv);
+      return json(result);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
   if (action === "uploadFile") {
     return json({
       ok: false,
@@ -621,7 +824,7 @@ export default {
       return json({
         ok: true,
         service: "skhps-backend",
-        version: "0.1.1-hidden-upload",
+        version: "0.1.2-hidden-upload-staff-race",
         kvBinding: !!env.SKHPS_CACHE,
         hasSupabaseUrl: !!env.SUPABASE_URL,
         hasSupabaseServiceKey: !!env.SUPABASE_SERVICE_ROLE_KEY,
