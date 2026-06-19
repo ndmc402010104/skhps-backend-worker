@@ -5,3 +5,14 @@ compatibility_date = "2026-06-17"
 [[kv_namespaces]]
 binding = "SKHPS_CACHE"
 id = "c1ac2805811648448d9c735a48520ac8"
+
+
+[vars]
+
+QR_SIGNIN_MEETING_TABLE = "QrSigninMeeting"
+QR_SIGNIN_RECORD_TABLE = "QrSigninRecord"
+QR_SIGNIN_AUDIT_TABLE = "QrSigninRecordAudit"
+QR_SIGNIN_MEETING_SUMMARY_VIEW = "QrSigninMeetingSummary"
+QR_SIGNIN_CALENDAR_ID = "c25b1d017823114707a1edf8d8491894b063fe07b48e1d9fdc627c6b03b8a76b@group.calendar.google.com"
+# 若 Google Calendar 不是 public ICS，可暫時保留 Apps Script fallback；穩定後可移除。
+QR_SIGNIN_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyPo545p6EYBa5qMRgK9WVzvhTbRqFtMHJ9CVio4AJ_Rak8_HvanYlhZVr85R6NmemWAw/exec"

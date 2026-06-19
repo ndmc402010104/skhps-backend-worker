@@ -32,6 +32,18 @@ export interface Env {
   SUPABASE_STAFF_TABLE?: string;
   SUPABASE_EXTERNAL_PROJECT_TABLE?: string;
   MAX_FILE_SIZE_BYTES?: string;
+
+  QR_SIGNIN_MEETING_TABLE?: string;
+  QR_SIGNIN_RECORD_TABLE?: string;
+  QR_SIGNIN_AUDIT_TABLE?: string;
+  QR_SIGNIN_MEETING_SUMMARY_VIEW?: string;
+  QR_SIGNIN_CALENDAR_ID?: string;
+  QR_SIGNIN_CALENDAR_ICS_URL?: string;
+  QR_SIGNIN_APPS_SCRIPT_URL?: string;
+  QR_SIGNIN_CALENDAR_LOOKBACK_DAYS?: string;
+  QR_SIGNIN_CALENDAR_LOOKAHEAD_DAYS?: string;
+  QR_SIGNIN_RUNNING_BEFORE_MIN?: string;
+  QR_SIGNIN_RUNNING_AFTER_MIN?: string;
 }
 
 type AppEnvName = "local-dev" | "dev" | "prod";
@@ -102,6 +114,15 @@ const DEFAULT_UPLOAD_BUCKET = "skhps-uploads";
 const DEFAULT_UPLOAD_TABLE = "skhps_file_uploads";
 const DEFAULT_STAFF_TABLE = "StaffMaster";
 const DEFAULT_EXTERNAL_PROJECT_TABLE = "ExternalProject";
+const DEFAULT_QR_SIGNIN_MEETING_TABLE = "QrSigninMeeting";
+const DEFAULT_QR_SIGNIN_RECORD_TABLE = "QrSigninRecord";
+const DEFAULT_QR_SIGNIN_AUDIT_TABLE = "QrSigninRecordAudit";
+const DEFAULT_QR_SIGNIN_MEETING_SUMMARY_VIEW = "QrSigninMeetingSummary";
+const DEFAULT_QR_SIGNIN_CALENDAR_ID = "c25b1d017823114707a1edf8d8491894b063fe07b48e1d9fdc627c6b03b8a76b@group.calendar.google.com";
+const DEFAULT_QR_SIGNIN_RUNNING_BEFORE_MIN = 30;
+const DEFAULT_QR_SIGNIN_RUNNING_AFTER_MIN = 10;
+const DEFAULT_QR_SIGNIN_LOOKBACK_DAYS = 45;
+const DEFAULT_QR_SIGNIN_LOOKAHEAD_DAYS = 45;
 const DEFAULT_MAX_FILE_SIZE_BYTES = 6 * 1024 * 1024;
 
 function corsHeaders(): HeadersInit {
@@ -1251,6 +1272,824 @@ async function getQuickLoginStaff(env: Env, appEnv: AppEnvName) {
   return payload;
 }
 
+
+
+type QrSigninMeetingRow = {
+  id: string;
+  app_id: string;
+  env: string;
+  source: string;
+  source_id: string | null;
+  calendar_id: string | null;
+  title: string;
+  meeting_date: string | null;
+  time_label: string | null;
+  starts_at: string | null;
+  ends_at: string | null;
+  timezone: string;
+  open_before_minutes: number;
+  close_after_minutes: number;
+  enabled: boolean;
+  status: string;
+  created_by: string | null;
+  updated_by: string | null;
+  notes: string | null;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type QrSigninRecordRow = {
+  id: string;
+  meeting_id: string;
+  app_id: string;
+  env: string;
+  name: string;
+  employee_id: string | null;
+  role: string | null;
+  staff_source: string;
+  signed_at: string | null;
+  submitted_at: string;
+  status: string;
+  reason: string | null;
+  source: string;
+  duplicate_of: string | null;
+  client_request_id: string | null;
+  created_by: string | null;
+  updated_by: string | null;
+  note: string | null;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type QrSigninSummaryRow = {
+  id: string;
+  app_id: string;
+  env: string;
+  title: string;
+  meeting_date: string | null;
+  time_label: string | null;
+  starts_at: string | null;
+  ends_at: string | null;
+  timezone: string;
+  enabled: boolean;
+  status: string;
+  source: string;
+  source_id: string | null;
+  total_records: number;
+  signed_count: number;
+  late_count: number;
+  outside_window_count: number;
+  leave_count: number;
+  absent_count: number;
+  void_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+function getQrSigninMeetingTable(env: Env): string {
+  return String(env.QR_SIGNIN_MEETING_TABLE || DEFAULT_QR_SIGNIN_MEETING_TABLE).trim() || DEFAULT_QR_SIGNIN_MEETING_TABLE;
+}
+
+function getQrSigninRecordTable(env: Env): string {
+  return String(env.QR_SIGNIN_RECORD_TABLE || DEFAULT_QR_SIGNIN_RECORD_TABLE).trim() || DEFAULT_QR_SIGNIN_RECORD_TABLE;
+}
+
+function getQrSigninAuditTable(env: Env): string {
+  return String(env.QR_SIGNIN_AUDIT_TABLE || DEFAULT_QR_SIGNIN_AUDIT_TABLE).trim() || DEFAULT_QR_SIGNIN_AUDIT_TABLE;
+}
+
+function getQrSigninSummaryView(env: Env): string {
+  return String(env.QR_SIGNIN_MEETING_SUMMARY_VIEW || DEFAULT_QR_SIGNIN_MEETING_SUMMARY_VIEW).trim() || DEFAULT_QR_SIGNIN_MEETING_SUMMARY_VIEW;
+}
+
+function qrNumberFromEnv(input: unknown, fallback: number): number {
+  const n = Number(input);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function getQrSigninCalendarId(env: Env): string {
+  return String(env.QR_SIGNIN_CALENDAR_ID || DEFAULT_QR_SIGNIN_CALENDAR_ID).trim();
+}
+
+function getQrSigninCalendarIcsUrl(env: Env): string {
+  const configured = String(env.QR_SIGNIN_CALENDAR_ICS_URL || "").trim();
+  if (configured) return configured;
+
+  const calendarId = getQrSigninCalendarId(env);
+  if (!calendarId) return "";
+
+  return `https://calendar.google.com/calendar/ical/${encodeURIComponent(calendarId)}/public/basic.ics`;
+}
+
+function getQrSigninWindowConfig(env: Env): { beforeMinutes: number; afterMinutes: number } {
+  return {
+    beforeMinutes: qrNumberFromEnv(env.QR_SIGNIN_RUNNING_BEFORE_MIN, DEFAULT_QR_SIGNIN_RUNNING_BEFORE_MIN),
+    afterMinutes: qrNumberFromEnv(env.QR_SIGNIN_RUNNING_AFTER_MIN, DEFAULT_QR_SIGNIN_RUNNING_AFTER_MIN)
+  };
+}
+
+function formatTaipeiDate(value: Date, pattern: "Y-M-D" | "M/d" | "H:mm"): string {
+  if (pattern === "Y-M-D") {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Taipei",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(value);
+    const get = (type: string) => parts.find((part) => part.type === type)?.value || "";
+    return `${get("year")}-${get("month")}-${get("day")}`;
+  }
+
+  const parts = new Intl.DateTimeFormat("zh-TW", {
+    timeZone: "Asia/Taipei",
+    month: pattern === "M/d" ? "numeric" : undefined,
+    day: pattern === "M/d" ? "numeric" : undefined,
+    hour: pattern === "H:mm" ? "2-digit" : undefined,
+    minute: pattern === "H:mm" ? "2-digit" : undefined,
+    hour12: false
+  }).formatToParts(value);
+  const get = (type: string) => parts.find((part) => part.type === type)?.value || "";
+
+  if (pattern === "M/d") return `${get("month")}/${get("day")}`;
+  return `${get("hour")}:${get("minute")}`;
+}
+
+function unfoldIcs(text: string): string {
+  return text.replace(/\r?\n[ \t]/g, "").replace(/\r\n/g, "\n");
+}
+
+function readIcsProperty(block: string, name: string): string {
+  const lines = block.split("\n");
+  const upperName = name.toUpperCase();
+
+  for (const line of lines) {
+    const colon = line.indexOf(":");
+    if (colon < 0) continue;
+    const left = line.slice(0, colon).toUpperCase();
+    if (left === upperName || left.startsWith(upperName + ";")) return line.slice(colon + 1).trim();
+  }
+
+  return "";
+}
+
+function decodeIcsText(value: string): string {
+  return String(value || "")
+    .replace(/\\n/g, " ")
+    .replace(/\\,/g, ",")
+    .replace(/\\;/g, ";")
+    .replace(/\\\\/g, "\\")
+    .trim();
+}
+
+function parseIcsDate(value: string): Date | null {
+  const raw = String(value || "").trim();
+  const match = raw.match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})?)?(Z)?$/);
+  if (!match) return null;
+
+  const yyyy = match[1];
+  const mm = match[2];
+  const dd = match[3];
+  const hh = match[4] || "00";
+  const mi = match[5] || "00";
+  const ss = match[6] || "00";
+  const suffix = match[7] ? "Z" : "+08:00";
+  const parsed = new Date(`${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}${suffix}`);
+  return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+function makeQrSigninSourceId(source: string, title: string, startsAt: string, endsAt: string): string {
+  return [source, title, startsAt, endsAt].map((part) => String(part || "").trim()).join("::");
+}
+
+function toQrSigninMeetingRowFromDates(input: {
+  envName: AppEnvName;
+  title: string;
+  start: Date;
+  end: Date;
+  source: string;
+  sourceId?: string;
+  calendarId?: string;
+  metadata?: Record<string, unknown>;
+}): Record<string, unknown> {
+  const windowConfig = getQrSigninWindowConfig({} as Env);
+  const startsAt = input.start.toISOString();
+  const endsAt = input.end.toISOString();
+  const sourceId = input.sourceId || makeQrSigninSourceId(input.source, input.title, startsAt, endsAt);
+
+  return {
+    app_id: "qr-signin",
+    env: input.envName,
+    source: input.source,
+    source_id: sourceId,
+    calendar_id: input.calendarId || null,
+    title: input.title,
+    meeting_date: formatTaipeiDate(input.start, "Y-M-D"),
+    time_label: `${formatTaipeiDate(input.start, "H:mm")}-${formatTaipeiDate(input.end, "H:mm")}`,
+    starts_at: startsAt,
+    ends_at: endsAt,
+    timezone: "Asia/Taipei",
+    open_before_minutes: windowConfig.beforeMinutes,
+    close_after_minutes: windowConfig.afterMinutes,
+    enabled: true,
+    status: "active",
+    metadata: input.metadata || {}
+  };
+}
+
+function parseQrSigninIcsRows(text: string, env: Env, payload: Record<string, unknown>): Record<string, unknown>[] {
+  const now = new Date();
+  const lookbackDays = qrNumberFromEnv(payload.lookbackDays, qrNumberFromEnv(env.QR_SIGNIN_CALENDAR_LOOKBACK_DAYS, DEFAULT_QR_SIGNIN_LOOKBACK_DAYS));
+  const lookaheadDays = qrNumberFromEnv(payload.lookaheadDays, qrNumberFromEnv(env.QR_SIGNIN_CALENDAR_LOOKAHEAD_DAYS, DEFAULT_QR_SIGNIN_LOOKAHEAD_DAYS));
+  const first = new Date(now.getTime() - lookbackDays * 86400000);
+  const last = new Date(now.getTime() + lookaheadDays * 86400000);
+  const envName = normalizeEnv(firstText(payload.env, payload.runtime));
+  const calendarId = getQrSigninCalendarId(env);
+  const blocks = unfoldIcs(text).match(/BEGIN:VEVENT[\s\S]*?END:VEVENT/g) || [];
+
+  return blocks
+    .map((block) => {
+      const title = decodeIcsText(readIcsProperty(block, "SUMMARY"));
+      const uid = decodeIcsText(readIcsProperty(block, "UID"));
+      const start = parseIcsDate(readIcsProperty(block, "DTSTART"));
+      const end = parseIcsDate(readIcsProperty(block, "DTEND"));
+      if (!title || !start || !end) return null;
+      if (start.getTime() < first.getTime() || start.getTime() > last.getTime()) return null;
+      return toQrSigninMeetingRowFromDates({
+        envName,
+        title,
+        start,
+        end,
+        source: "google-calendar-ics",
+        sourceId: uid || undefined,
+        calendarId,
+        metadata: { rawSource: "ics" }
+      });
+    })
+    .filter((item): item is Record<string, unknown> => !!item);
+}
+
+function splitQrSigninCourseInfo(rawCourse: unknown, rawDate: unknown): { meeting: string; date: string; time: string } {
+  const courseText = String(rawCourse || "").trim();
+  const dateText = String(rawDate || "").trim();
+  let meeting = courseText;
+  let meetingDate = "";
+  let meetingTime = dateText;
+  const courseMatch = courseText.match(/^(\d{1,2}\/\d{1,2})\s+(.+)$/);
+  const dateMatch = dateText.match(/^(\d{1,2}\/\d{1,2})\s*(?:[|｜]\s*)?(.+)$/);
+
+  if (courseMatch) {
+    meetingDate = courseMatch[1];
+    meeting = courseMatch[2].trim();
+  }
+
+  if (dateMatch) {
+    meetingDate = dateMatch[1];
+    meetingTime = dateMatch[2].trim();
+  }
+
+  return { meeting, date: meetingDate, time: meetingTime };
+}
+
+function parseLegacyMeetingDate(raw: unknown): { meetingDate: string | null; timeLabel: string; startsAt: string | null; endsAt: string | null } {
+  const text = String(raw || "").trim();
+  const dateMatch = text.match(/^(\d{1,2})\/(\d{1,2})\s*(?:[|｜]\s*)?(.*)$/);
+  const timeMatch = text.match(/(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})/);
+  const now = new Date();
+  const year = now.getFullYear();
+
+  if (!dateMatch || !timeMatch) {
+    return { meetingDate: null, timeLabel: text, startsAt: null, endsAt: null };
+  }
+
+  const month = Number(dateMatch[1]);
+  const day = Number(dateMatch[2]);
+  const parseTime = (value: string) => {
+    const m = value.match(/^(\d{1,2}):(\d{2})$/);
+    return m ? { hour: Number(m[1]), minute: Number(m[2]) } : null;
+  };
+  const startPart = parseTime(timeMatch[1]);
+  const endPart = parseTime(timeMatch[2]);
+  if (!startPart || !endPart) return { meetingDate: null, timeLabel: text, startsAt: null, endsAt: null };
+
+  const start = new Date(year, month - 1, day, startPart.hour, startPart.minute, 0);
+  const end = new Date(year, month - 1, day, endPart.hour, endPart.minute, 0);
+  if (end.getTime() < start.getTime()) end.setDate(end.getDate() + 1);
+
+  return {
+    meetingDate: `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`,
+    timeLabel: `${timeMatch[1]}-${timeMatch[2]}`,
+    startsAt: start.toISOString(),
+    endsAt: end.toISOString()
+  };
+}
+
+function toQrSigninMeetingRowFromLegacy(input: {
+  envName: AppEnvName;
+  course: unknown;
+  date: unknown;
+  source: string;
+  sourceId?: string;
+  metadata?: Record<string, unknown>;
+}): Record<string, unknown> {
+  const info = splitQrSigninCourseInfo(input.course, input.date);
+  const parsed = parseLegacyMeetingDate(info.date ? `${info.date} ${info.time}` : input.date);
+  const sourceId = input.sourceId || makeQrSigninSourceId(input.source, info.meeting, parsed.startsAt || String(input.date || ""), parsed.endsAt || "");
+  const windowConfig = getQrSigninWindowConfig({} as Env);
+
+  return {
+    app_id: "qr-signin",
+    env: input.envName,
+    source: input.source,
+    source_id: sourceId,
+    calendar_id: null,
+    title: info.meeting || String(input.course || "").trim(),
+    meeting_date: parsed.meetingDate,
+    time_label: parsed.timeLabel || info.time || String(input.date || "").trim(),
+    starts_at: parsed.startsAt,
+    ends_at: parsed.endsAt,
+    timezone: "Asia/Taipei",
+    open_before_minutes: windowConfig.beforeMinutes,
+    close_after_minutes: windowConfig.afterMinutes,
+    enabled: true,
+    status: "active",
+    metadata: input.metadata || {}
+  };
+}
+
+async function callQrSigninAppsScriptFallback(env: Env, action: string, payload: Record<string, unknown>): Promise<unknown | null> {
+  const endpoint = String(env.QR_SIGNIN_APPS_SCRIPT_URL || "").trim();
+  if (!endpoint) return null;
+
+  const url = new URL(endpoint);
+  url.searchParams.set("action", action);
+  url.searchParams.set("payload", JSON.stringify(payload || {}));
+  url.searchParams.set("_", String(Date.now()));
+
+  const response = await fetch(url.toString(), { method: "GET" });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`QR_SIGNIN_APPS_SCRIPT_FAILED ${response.status} ${text}`);
+  return text ? JSON.parse(text) : null;
+}
+
+function qrSigninMeetingDisplay(row: QrSigninMeetingRow): Record<string, unknown> {
+  const start = row.starts_at ? new Date(row.starts_at) : null;
+  const datePrefix = start && Number.isFinite(start.getTime()) ? formatTaipeiDate(start, "M/d") : (row.meeting_date || "");
+  const course = datePrefix ? `${datePrefix} ${row.title}` : row.title;
+  const now = Date.now();
+  const startsAt = row.starts_at ? Date.parse(row.starts_at) : NaN;
+  const endsAt = row.ends_at ? Date.parse(row.ends_at) : NaN;
+  const isRunning = Number.isFinite(startsAt) && Number.isFinite(endsAt)
+    ? now >= startsAt - Number(row.open_before_minutes || 0) * 60000 && now <= endsAt + Number(row.close_after_minutes || 0) * 60000
+    : false;
+
+  return {
+    id: row.id,
+    meetingId: row.id,
+    course,
+    date: row.time_label || "",
+    title: row.title,
+    meetingDate: row.meeting_date || "",
+    timeLabel: row.time_label || "",
+    startTime: row.starts_at || "",
+    endTime: row.ends_at || "",
+    isRunning,
+    selected: isRunning,
+    source: row.source,
+    status: row.status,
+    enabled: row.enabled
+  };
+}
+
+async function listQrSigninMeetingRows(env: Env, appEnv: AppEnvName, limit = 200): Promise<QrSigninMeetingRow[]> {
+  const table = getQrSigninMeetingTable(env);
+  const rows = await supabaseGet<QrSigninMeetingRow[]>(
+    env,
+    `${encodeURIComponent(table)}?select=*&env=eq.${encodeURIComponent(appEnv)}&enabled=eq.true&status=eq.active&order=starts_at.desc.nullslast&limit=${limit}`
+  );
+  return rows;
+}
+
+async function findQrSigninMeetingBySource(env: Env, row: Record<string, unknown>): Promise<QrSigninMeetingRow | null> {
+  const table = getQrSigninMeetingTable(env);
+  const envName = firstText(row.env);
+  const source = firstText(row.source);
+  const sourceId = firstText(row.source_id);
+  if (!envName || !source || !sourceId) return null;
+
+  const rows = await supabaseGet<QrSigninMeetingRow[]>(
+    env,
+    `${encodeURIComponent(table)}?select=*&env=eq.${encodeURIComponent(envName)}&source=eq.${encodeURIComponent(source)}&source_id=eq.${encodeURIComponent(sourceId)}&limit=1`
+  );
+  return rows[0] || null;
+}
+
+async function saveQrSigninMeetingRows(env: Env, rows: Record<string, unknown>[]): Promise<QrSigninMeetingRow[]> {
+  const table = getQrSigninMeetingTable(env);
+  const saved: QrSigninMeetingRow[] = [];
+
+  for (const row of rows) {
+    const existing = await findQrSigninMeetingBySource(env, row).catch(() => null);
+    if (existing) {
+      saved.push(existing);
+      continue;
+    }
+
+    const inserted = await supabasePost<QrSigninMeetingRow[]>(env, table, row);
+    if (Array.isArray(inserted) && inserted[0]) saved.push(inserted[0]);
+  }
+
+  return saved;
+}
+
+async function syncQrSigninMeetingsFromIcs(env: Env, payload: Record<string, unknown>): Promise<QrSigninMeetingRow[]> {
+  const icsUrl = getQrSigninCalendarIcsUrl(env);
+  if (!icsUrl) throw new Error("QR_SIGNIN_CALENDAR_ICS_URL_MISSING");
+
+  const response = await fetch(icsUrl, { method: "GET" });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`QR_SIGNIN_ICS_FETCH_FAILED ${response.status} ${text.slice(0, 200)}`);
+
+  const rows = parseQrSigninIcsRows(text, env, payload);
+  if (!rows.length) return [];
+
+  const table = getQrSigninMeetingTable(env);
+  return await saveQrSigninMeetingRows(env, rows);
+}
+
+async function syncQrSigninMeetingsFromAppsScript(env: Env, payload: Record<string, unknown>): Promise<QrSigninMeetingRow[]> {
+  const fallback = await callQrSigninAppsScriptFallback(env, "getQrSigninMeetings", payload) as any;
+  const data = fallback && fallback.data ? fallback.data : fallback;
+  const meetings = data && Array.isArray(data.meetings) ? data.meetings : [];
+  if (!meetings.length) return [];
+
+  const envName = normalizeEnv(firstText(payload.env, payload.runtime));
+  const rows = meetings.map((meeting: any) => toQrSigninMeetingRowFromLegacy({
+    envName,
+    course: meeting.course || meeting.title,
+    date: meeting.date || meeting.time || meeting.timeLabel,
+    source: "apps-script-calendar",
+    sourceId: firstText(meeting.id, meeting.eventId, meeting.uid),
+    metadata: { rawSource: "apps-script", rawMeeting: meeting }
+  }));
+  const table = getQrSigninMeetingTable(env);
+  return await saveQrSigninMeetingRows(env, rows);
+}
+
+async function getQrSigninMeetings(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const appEnv = normalizeEnv(firstText(body.env, payload.env));
+  const forceSync = booleanFromUnknown(payload.forceSync) || booleanFromUnknown(payload.syncCalendar);
+  let rows: QrSigninMeetingRow[] = [];
+  let syncSource = "supabase";
+  let syncError = "";
+
+  try {
+    rows = await listQrSigninMeetingRows(env, appEnv);
+  } catch (error) {
+    syncError = error instanceof Error ? error.message : String(error);
+  }
+
+  if (forceSync || rows.length === 0) {
+    try {
+      rows = await syncQrSigninMeetingsFromIcs(env, { ...payload, env: appEnv });
+      syncSource = "google-calendar-ics";
+    } catch (icsError) {
+      try {
+        rows = await syncQrSigninMeetingsFromAppsScript(env, { ...payload, env: appEnv });
+        syncSource = "apps-script-calendar";
+        syncError = icsError instanceof Error ? icsError.message : String(icsError);
+      } catch (fallbackError) {
+        syncError = [icsError, fallbackError].map((error) => error instanceof Error ? error.message : String(error)).filter(Boolean).join(" | ");
+      }
+    }
+
+    if (!rows.length) {
+      rows = await listQrSigninMeetingRows(env, appEnv).catch(() => []);
+    }
+  }
+
+  const meetings = rows.map(qrSigninMeetingDisplay);
+
+  return {
+    ok: true,
+    action: "getQrSigninMeetings",
+    source: syncSource,
+    table: getQrSigninMeetingTable(env),
+    count: meetings.length,
+    data: {
+      ok: true,
+      meetings,
+      source: syncSource,
+      syncError
+    },
+    meetings,
+    diagnostics: {
+      syncSource,
+      syncError,
+      hasAppsScriptFallback: !!env.QR_SIGNIN_APPS_SCRIPT_URL,
+      calendarId: getQrSigninCalendarId(env)
+    }
+  };
+}
+
+async function createQrSigninMeeting(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const appEnv = normalizeEnv(firstText(body.env, payload.env));
+  const title = firstText(payload.title, payload.meeting, payload.course);
+  const date = firstText(payload.date, payload.time, payload.timeLabel);
+
+  if (!title || !date) {
+    return { ok: false, action: "createQrSigninMeeting", error: "MISSING_MEETING_FIELD", message: "缺少會議名稱或會議時間" };
+  }
+
+  const record = toQrSigninMeetingRowFromLegacy({
+    envName: appEnv,
+    course: title,
+    date,
+    source: "manual",
+    sourceId: firstText(payload.sourceId, payload.clientRequestId) || makeQrSigninSourceId("manual", title, date, ""),
+    metadata: { rawPayload: payload }
+  });
+
+  const table = getQrSigninMeetingTable(env);
+  const savedRows = await saveQrSigninMeetingRows(env, [record]);
+  const saved = savedRows[0] || record as QrSigninMeetingRow;
+  const meeting = qrSigninMeetingDisplay(saved);
+
+  return {
+    ok: true,
+    action: "createQrSigninMeeting",
+    source: "skhps-backend-supabase",
+    table,
+    data: { ok: true, meeting },
+    meeting
+  };
+}
+
+async function getQrSigninMeeting(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const meetingId = firstText(payload.meetingId, payload.id);
+  if (!meetingId) return { ok: false, action: "getQrSigninMeeting", error: "MISSING_MEETING_ID" };
+
+  const table = getQrSigninMeetingTable(env);
+  const rows = await supabaseGet<QrSigninMeetingRow[]>(env, `${encodeURIComponent(table)}?select=*&id=eq.${encodeURIComponent(meetingId)}&limit=1`);
+  if (!rows.length) return { ok: false, action: "getQrSigninMeeting", error: "MEETING_NOT_FOUND", meetingId };
+
+  const meeting = qrSigninMeetingDisplay(rows[0]);
+  return { ok: true, action: "getQrSigninMeeting", source: "skhps-backend-supabase", table, data: { ok: true, meeting }, meeting };
+}
+
+function normalizeQrSigninSubmitPayload(body: any): Record<string, unknown> {
+  const payload = body && body.payload && typeof body.payload === "object" ? body.payload : body || {};
+  return payload as Record<string, unknown>;
+}
+
+function qrSigninFrontendStatus(row: QrSigninRecordRow): string {
+  if (row.status === "signed" || row.status === "manual") return "success";
+  if (row.status === "duplicate") return "duplicate";
+  if (row.status === "outside_window" || row.status === "late") return "closed";
+  return row.status || "failed";
+}
+
+function qrSigninReasonText(status: string): string {
+  if (status === "duplicate") return "already-signed";
+  if (status === "outside_window" || status === "late") return "not-in-window";
+  if (status === "error") return "backend-error";
+  return "";
+}
+
+function qrSigninResultFromRecord(row: QrSigninRecordRow, meeting?: QrSigninMeetingRow | null): Record<string, unknown> {
+  const display = meeting ? qrSigninMeetingDisplay(meeting) : {} as Record<string, unknown>;
+  const status = qrSigninFrontendStatus(row);
+  const reason = row.reason || qrSigninReasonText(row.status);
+  return {
+    resultId: row.id,
+    meetingId: row.meeting_id,
+    status,
+    reason,
+    meeting: firstText(display.title, display.course, "會議簽到"),
+    date: firstText(display.meetingDate),
+    time: firstText(display.timeLabel),
+    name: row.name,
+    employeeId: row.employee_id || "",
+    role: row.role || "",
+    signedAt: row.signed_at || row.submitted_at,
+    message: status === "success" ? "簽到成功" : status === "duplicate" ? "你已經簽到過，不需要重複送出" : "簽到失敗"
+  };
+}
+
+async function findQrSigninMeetingRow(env: Env, meetingId: string): Promise<QrSigninMeetingRow | null> {
+  const table = getQrSigninMeetingTable(env);
+  const rows = await supabaseGet<QrSigninMeetingRow[]>(env, `${encodeURIComponent(table)}?select=*&id=eq.${encodeURIComponent(meetingId)}&limit=1`);
+  return rows[0] || null;
+}
+
+async function findExistingQrSigninRecord(env: Env, input: { meetingId: string; employeeId: string; name: string }): Promise<QrSigninRecordRow | null> {
+  const table = getQrSigninRecordTable(env);
+  let path = `${encodeURIComponent(table)}?select=*&meeting_id=eq.${encodeURIComponent(input.meetingId)}&status=not.in.(duplicate,void,error)&limit=1`;
+  if (input.employeeId) {
+    path += `&employee_id=eq.${encodeURIComponent(input.employeeId)}`;
+  } else {
+    path += `&name=eq.${encodeURIComponent(input.name)}`;
+  }
+  const rows = await supabaseGet<QrSigninRecordRow[]>(env, path);
+  return rows[0] || null;
+}
+
+function determineQrSigninRecordStatus(meeting: QrSigninMeetingRow): { status: string; reason: string } {
+  const now = Date.now();
+  const startsAt = meeting.starts_at ? Date.parse(meeting.starts_at) : NaN;
+  const endsAt = meeting.ends_at ? Date.parse(meeting.ends_at) : NaN;
+
+  if (!Number.isFinite(startsAt) || !Number.isFinite(endsAt)) {
+    return { status: "signed", reason: "" };
+  }
+
+  const start = startsAt - Number(meeting.open_before_minutes || 0) * 60000;
+  const end = endsAt + Number(meeting.close_after_minutes || 0) * 60000;
+
+  if (now < start || now > end) {
+    return { status: "outside_window", reason: "not-in-window" };
+  }
+
+  return { status: "signed", reason: "" };
+}
+
+async function insertQrSigninAudit(env: Env, input: Record<string, unknown>): Promise<void> {
+  const table = getQrSigninAuditTable(env);
+  await supabasePost<unknown[]>(env, table, input).catch(() => []);
+}
+
+async function submitQrSignin(env: Env, body: any) {
+  const payload = normalizeQrSigninSubmitPayload(body);
+  const appEnv = normalizeEnv(firstText(body.env, payload.env));
+  let meetingId = firstText(payload.meetingId, payload.id);
+  const name = firstText(payload.name);
+  const employeeId = firstText(payload.employeeId, payload.emp);
+  const role = firstText(payload.role);
+  const signedAt = firstText(payload.signedAt, new Date().toISOString());
+  const clientRequestId = firstText(payload.clientRequestId);
+
+  if (!name || !role) {
+    return { ok: false, action: "submitQrSignin", error: "MISSING_FIELD", message: "缺少姓名或職級" };
+  }
+
+  let meeting = meetingId ? await findQrSigninMeetingRow(env, meetingId) : null;
+
+  if (!meeting) {
+    const course = firstText(payload.course, payload.title, payload.meeting);
+    const date = firstText(payload.date, payload.time, payload.timeLabel, payload.meetingTime);
+
+    if (!course || !date) {
+      return { ok: false, action: "submitQrSignin", error: "MISSING_FIELD", message: "缺少場次資訊" };
+    }
+
+    const record = toQrSigninMeetingRowFromLegacy({
+      envName: appEnv,
+      course,
+      date,
+      source: "signin-payload",
+      sourceId: firstText(payload.sourceId, clientRequestId) || makeQrSigninSourceId("signin-payload", course, date, ""),
+      metadata: { rawPayload: payload, createdBy: "submitQrSignin" }
+    });
+    const savedRows = await saveQrSigninMeetingRows(env, [record]);
+    meeting = savedRows[0] || record as QrSigninMeetingRow;
+    meetingId = meeting.id;
+  }
+
+  if (!meeting || !meeting.enabled || meeting.status !== "active") {
+    return { ok: false, action: "submitQrSignin", error: "MEETING_NOT_FOUND", message: "找不到可簽到的會議場次" };
+  }
+
+  const existing = await findExistingQrSigninRecord(env, { meetingId, employeeId, name });
+  const statusInfo = existing ? { status: "duplicate", reason: "already-signed" } : determineQrSigninRecordStatus(meeting);
+  const table = getQrSigninRecordTable(env);
+  const record: Record<string, unknown> = {
+    meeting_id: meetingId,
+    app_id: "qr-signin",
+    env: appEnv,
+    name,
+    employee_id: employeeId || null,
+    role,
+    staff_source: "StaffMaster",
+    signed_at: signedAt,
+    status: statusInfo.status,
+    reason: statusInfo.reason || null,
+    source: "qr",
+    duplicate_of: existing ? existing.id : null,
+    client_request_id: clientRequestId || null,
+    metadata: {
+      rawPayload: payload,
+      duplicateOf: existing ? existing.id : ""
+    }
+  };
+
+  const inserted = await supabasePost<QrSigninRecordRow[]>(env, table, record);
+  const saved = Array.isArray(inserted) && inserted[0] ? inserted[0] : record as QrSigninRecordRow;
+  await insertQrSigninAudit(env, {
+    record_id: saved.id || null,
+    meeting_id: meetingId,
+    action: existing ? "duplicate-signin" : "qr-signin",
+    actor_name: name,
+    actor_employee_id: employeeId || null,
+    after_data: saved,
+    metadata: { source: "submitQrSignin" }
+  });
+  const result = qrSigninResultFromRecord(saved, meeting);
+
+  return {
+    ok: true,
+    action: "submitQrSignin",
+    source: "skhps-backend-supabase",
+    table,
+    data: result,
+    ...result
+  };
+}
+
+async function getQrSigninResult(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const resultId = firstText(payload.resultId, payload.id);
+  if (!resultId) return { ok: false, action: "getQrSigninResult", error: "MISSING_RESULT_ID" };
+
+  const table = getQrSigninRecordTable(env);
+  const rows = await supabaseGet<QrSigninRecordRow[]>(env, `${encodeURIComponent(table)}?select=*&id=eq.${encodeURIComponent(resultId)}&limit=1`);
+  if (!rows.length) return { ok: false, action: "getQrSigninResult", error: "RESULT_NOT_FOUND", resultId };
+
+  const meeting = await findQrSigninMeetingRow(env, rows[0].meeting_id).catch(() => null);
+  const result = qrSigninResultFromRecord(rows[0], meeting);
+  return { ok: true, action: "getQrSigninResult", source: "skhps-backend-supabase", table, data: result, ...result };
+}
+
+async function listQrSigninRecords(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const limit = Math.min(Math.max(qrNumberFromEnv(payload.limit, 100), 1), 500);
+  const meetingId = firstText(payload.meetingId);
+  const table = getQrSigninRecordTable(env);
+  let path = `${encodeURIComponent(table)}?select=*&order=created_at.desc&limit=${limit}`;
+  if (meetingId) path += `&meeting_id=eq.${encodeURIComponent(meetingId)}`;
+  const rows = await supabaseGet<QrSigninRecordRow[]>(env, path);
+
+  const meetingIds = Array.from(new Set(rows.map((row) => row.meeting_id).filter(Boolean)));
+  const meetings = new Map<string, QrSigninMeetingRow>();
+  for (const id of meetingIds.slice(0, 30)) {
+    const meeting = await findQrSigninMeetingRow(env, id).catch(() => null);
+    if (meeting) meetings.set(id, meeting);
+  }
+
+  const records = rows.map((row) => qrSigninResultFromRecord(row, meetings.get(row.meeting_id) || null));
+  return { ok: true, action: "listQrSigninRecords", source: "skhps-backend-supabase", table, count: records.length, records, data: records };
+}
+
+async function getQrSigninDashboard(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const appEnv = normalizeEnv(firstText(body.env, payload.env));
+  const summaryView = getQrSigninSummaryView(env);
+  let summaries: QrSigninSummaryRow[] = [];
+  summaries = await supabaseGet<QrSigninSummaryRow[]>(
+    env,
+    `${encodeURIComponent(summaryView)}?select=*&env=eq.${encodeURIComponent(appEnv)}&order=starts_at.desc.nullslast&limit=20`
+  ).catch(() => []);
+  const recordsResult = await listQrSigninRecords(env, { payload: { limit: 100 } });
+  const records = Array.isArray(recordsResult.records) ? recordsResult.records as Record<string, unknown>[] : [];
+
+  return {
+    ok: true,
+    action: "getQrSigninDashboard",
+    source: "skhps-backend-supabase",
+    data: {
+      courses: summaries.map((item) => ({
+        title: item.title,
+        date: [item.meeting_date, item.time_label].filter(Boolean).join(" "),
+        status: item.enabled && item.status === "active" ? "可簽到" : "停用",
+        signed: Number(item.signed_count || 0),
+        expected: "-"
+      })),
+      qr: {
+        code: "使用 meetingId",
+        window: summaries[0] ? String(summaries[0].time_label || "-") : "-",
+        link: "QR URL 使用 meetingId"
+      },
+      records: records.map((record) => ({
+        name: record.name,
+        emp: record.employeeId,
+        role: record.role,
+        signedAt: record.signedAt,
+        status: record.status
+      })),
+      system: {
+        backend: "Cloudflare Worker",
+        calendar: "Supabase / QrSigninMeeting",
+        sheet: "Supabase / QrSigninRecord",
+        meetingId: "enabled"
+      }
+    }
+  };
+}
+
+
 async function handleUploadFile(request: Request, env: Env): Promise<Response> {
   const contentType =
     request.headers.get("Content-Type") ||
@@ -1464,6 +2303,96 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
     }
   }
 
+
+  if (action === "getQrSigninMeetings") {
+    try {
+      const result = await getQrSigninMeetings(env, body);
+      return json(result, result.ok === false ? 502 : 200);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+
+  if (action === "getQrSigninMeeting") {
+    try {
+      const result = await getQrSigninMeeting(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({ ok: false, action, source: "skhps-backend", error: error instanceof Error ? error.message : String(error) }, 500);
+    }
+  }
+
+  if (action === "createQrSigninMeeting") {
+    try {
+      const result = await createQrSigninMeeting(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({ ok: false, action, source: "skhps-backend", error: error instanceof Error ? error.message : String(error) }, 500);
+    }
+  }
+
+  if (action === "submitQrSignin") {
+    try {
+      const result = await submitQrSignin(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "getQrSigninResult") {
+    try {
+      const result = await getQrSigninResult(env, body);
+      return json(result, result.ok === false ? 404 : 200);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "listQrSigninRecords") {
+    try {
+      const result = await listQrSigninRecords(env, body);
+      return json(result);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "getQrSigninDashboard") {
+    try {
+      const result = await getQrSigninDashboard(env, body);
+      return json(result);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
   if (action === "uploadFile") {
     return json({
       ok: false,
@@ -1495,7 +2424,7 @@ export default {
       return json({
         ok: true,
         service: "skhps-backend",
-        version: "0.1.2-hidden-upload-staff-race",
+        version: "0.1.3-qr-signin-cloudflare-phase1",
         hasSupabaseUrl: !!env.SUPABASE_URL,
         hasSupabaseServiceKey: !!env.SUPABASE_SERVICE_ROLE_KEY,
         upload: {
@@ -1504,6 +2433,13 @@ export default {
           table: env.SUPABASE_UPLOAD_TABLE || DEFAULT_UPLOAD_TABLE,
           maxFileSizeBytes: getMaxFileSize(env),
           affectsGate: false
+        },
+        qrSignin: {
+          meetingTable: env.QR_SIGNIN_MEETING_TABLE || DEFAULT_QR_SIGNIN_MEETING_TABLE,
+          recordTable: env.QR_SIGNIN_RECORD_TABLE || DEFAULT_QR_SIGNIN_RECORD_TABLE,
+          calendarId: env.QR_SIGNIN_CALENDAR_ID || DEFAULT_QR_SIGNIN_CALENDAR_ID,
+          hasCalendarIcsUrl: !!env.QR_SIGNIN_CALENDAR_ICS_URL,
+          hasAppsScriptFallback: !!env.QR_SIGNIN_APPS_SCRIPT_URL
         }
       });
     }
