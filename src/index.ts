@@ -12,6 +12,7 @@
  *   - registerExternalApp
  *   - updateExternalProjectActivation / updateExternalAppSettings / setExternalAppActive
  *   - getQuickLoginStaff（讀 Supabase 共用人員主檔 StaffMaster）
+ *   - listStaffMaster / upsertStaffMaster / updateStaffMasterStatus / reorderStaffMaster（StaffMaster 管理）
  * - POST /api/upload-file
  *
  * 原則：
@@ -1272,6 +1273,335 @@ async function getQuickLoginStaff(env: Env, appEnv: AppEnvName) {
   return payload;
 }
 
+function staffMasterPayload(body: any): Record<string, unknown> {
+  const payload = body && body.payload && typeof body.payload === "object" ? body.payload : body || {};
+  return payload as Record<string, unknown>;
+}
+
+function normalizeStaffGroup(input: unknown): string {
+  const value = String(input || "").trim();
+
+  if (!value) return "";
+  if (value === "VS/F" || value.toLowerCase() === "vs/f" || value.toLowerCase() === "vs-f") return "VS/F";
+  if (value === "R/NP" || value.toLowerCase() === "r/np" || value.toLowerCase() === "r-np") return "R/NP";
+  if (value === "行政人員" || value.indexOf("行政") >= 0) return "行政人員";
+
+  return value;
+}
+
+function normalizeStaffRole(input: unknown): string {
+  const value = String(input || "").trim();
+  const upper = value.toUpperCase();
+
+  if (value === "F" || upper === "FELLOW") return "Fellow";
+  if (upper === "VS") return "VS";
+  if (upper === "NP") return "NP";
+  if (/^R[1-6]$/.test(upper)) return upper;
+  if (/^PGY[12]$/.test(upper)) return upper;
+
+  return value;
+}
+
+function staffPatchFromPayload(payload: Record<string, unknown>, options: { partial?: boolean } = {}): Record<string, unknown> {
+  const partial = Boolean(options.partial);
+  const patch: Record<string, unknown> = {};
+  const now = new Date().toISOString();
+
+  const hasName = Object.prototype.hasOwnProperty.call(payload, "name") || Object.prototype.hasOwnProperty.call(payload, "姓名");
+  const hasEmp = Object.prototype.hasOwnProperty.call(payload, "emp") || Object.prototype.hasOwnProperty.call(payload, "employeeId") || Object.prototype.hasOwnProperty.call(payload, "employee_id") || Object.prototype.hasOwnProperty.call(payload, "員工編號");
+  const hasRole = Object.prototype.hasOwnProperty.call(payload, "role") || Object.prototype.hasOwnProperty.call(payload, "title") || Object.prototype.hasOwnProperty.call(payload, "職級");
+  const hasGroup = Object.prototype.hasOwnProperty.call(payload, "group") || Object.prototype.hasOwnProperty.call(payload, "groupKey") || Object.prototype.hasOwnProperty.call(payload, "group_key") || Object.prototype.hasOwnProperty.call(payload, "分組");
+  const hasSort = Object.prototype.hasOwnProperty.call(payload, "sortOrder") || Object.prototype.hasOwnProperty.call(payload, "sort_order") || Object.prototype.hasOwnProperty.call(payload, "排序");
+  const hasEnabled = Object.prototype.hasOwnProperty.call(payload, "enabled") || Object.prototype.hasOwnProperty.call(payload, "active") || Object.prototype.hasOwnProperty.call(payload, "啟用");
+  const hasAllowQuickLogin = Object.prototype.hasOwnProperty.call(payload, "allowQuickLogin") || Object.prototype.hasOwnProperty.call(payload, "allow_quick_login") || Object.prototype.hasOwnProperty.call(payload, "允許快速登入");
+  const hasNote = Object.prototype.hasOwnProperty.call(payload, "note") || Object.prototype.hasOwnProperty.call(payload, "備註");
+
+  if (!partial || hasEnabled) {
+    patch["啟用"] = hasEnabled
+      ? booleanFromUnknown(Object.prototype.hasOwnProperty.call(payload, "enabled") ? payload.enabled : Object.prototype.hasOwnProperty.call(payload, "active") ? payload.active : payload["啟用"])
+      : true;
+  }
+
+  if (!partial || hasName) {
+    patch["姓名"] = firstText(payload.name, payload["姓名"]);
+  }
+
+  if (!partial || hasEmp) {
+    patch["員工編號"] = firstText(payload.emp, payload.employeeId, payload.employee_id, payload["員工編號"]);
+  }
+
+  if (!partial || hasRole) {
+    patch["職級"] = normalizeStaffRole(firstText(payload.role, payload.title, payload["職級"]));
+  }
+
+  if (!partial || hasGroup) {
+    patch["分組"] = normalizeStaffGroup(firstText(payload.group, payload.groupKey, payload.group_key, payload["分組"]));
+  }
+
+  if (!partial || hasSort) {
+    patch["排序"] = numberFromUnknown(
+      Object.prototype.hasOwnProperty.call(payload, "sortOrder") ? payload.sortOrder :
+        Object.prototype.hasOwnProperty.call(payload, "sort_order") ? payload.sort_order :
+          payload["排序"],
+      999
+    );
+  }
+
+  if (!partial || hasAllowQuickLogin) {
+    patch["允許快速登入"] = hasAllowQuickLogin
+      ? booleanFromUnknown(Object.prototype.hasOwnProperty.call(payload, "allowQuickLogin") ? payload.allowQuickLogin : Object.prototype.hasOwnProperty.call(payload, "allow_quick_login") ? payload.allow_quick_login : payload["允許快速登入"])
+      : true;
+  }
+
+  if (!partial || hasNote) {
+    patch["備註"] = firstText(payload.note, payload["備註"]);
+  }
+
+  patch["更新時間"] = now;
+
+  Object.keys(patch).forEach((key) => {
+    if (patch[key] === undefined || patch[key] === null) {
+      delete patch[key];
+    }
+  });
+
+  return patch;
+}
+
+function normalizeStaffMasterAdminRow(row: StaffMasterRow, tableName: string): Record<string, unknown> {
+  const person = toQuickLoginPerson(row, tableName);
+  return {
+    ...person,
+    raw: row,
+    source: "supabase",
+    sourceLabel: "Supabase / StaffMaster"
+  };
+}
+
+function staffEmpFromPayload(payload: Record<string, unknown>): string {
+  return firstText(payload.emp, payload.employeeId, payload.employee_id, payload.staffId, payload.staff_id, payload["員工編號"]);
+}
+
+async function findStaffMasterRowsByEmp(env: Env, emp: string): Promise<StaffMasterRow[]> {
+  const tableName = getStaffTable(env);
+  const empColumn = encodeURIComponent("員工編號");
+
+  return await supabaseGet<StaffMasterRow[]>(
+    env,
+    `${encodeURIComponent(tableName)}?${empColumn}=eq.${encodeURIComponent(emp)}&select=*`
+  );
+}
+
+async function listStaffMaster(env: Env, body: any) {
+  const payload = staffMasterPayload(body);
+  const appEnv = normalizeEnv(body.env || payload.env);
+  const tableName = getStaffTable(env);
+
+  const rows = await supabaseGet<StaffMasterRow[]>(
+    env,
+    `${encodeURIComponent(tableName)}?select=*`
+  );
+
+  const items = rows
+    .map((row) => normalizeStaffMasterAdminRow(row, tableName))
+    .sort((a, b) => {
+      const orderDiff = numberFromUnknown(a.sortOrder, 9999) - numberFromUnknown(b.sortOrder, 9999);
+      if (orderDiff !== 0) return orderDiff;
+      return String(a.emp || "").localeCompare(String(b.emp || ""));
+    });
+
+  return {
+    ok: true,
+    action: "listStaffMaster",
+    source: "skhps-backend-supabase",
+    sourceLabel: "Supabase / StaffMaster",
+    env: appEnv,
+    staffTable: tableName,
+    count: items.length,
+    fetchedAt: new Date().toISOString(),
+    items,
+    staffList: items,
+    rows: items
+  };
+}
+
+async function upsertStaffMaster(env: Env, body: any) {
+  const payload = staffMasterPayload(body);
+  const appEnv = normalizeEnv(body.env || payload.env);
+  const tableName = getStaffTable(env);
+  const record = staffPatchFromPayload(payload);
+  const emp = staffEmpFromPayload(record);
+
+  if (!firstText(record["姓名"])) {
+    return {
+      ok: false,
+      action: "upsertStaffMaster",
+      source: "skhps-backend-supabase",
+      error: "MISSING_NAME",
+      message: "姓名必填"
+    };
+  }
+
+  if (!emp) {
+    return {
+      ok: false,
+      action: "upsertStaffMaster",
+      source: "skhps-backend-supabase",
+      error: "MISSING_EMP",
+      message: "員工編號必填"
+    };
+  }
+
+  const existingRows = await findStaffMasterRowsByEmp(env, emp);
+  const empColumn = encodeURIComponent("員工編號");
+  let updated: StaffMasterRow[];
+
+  if (existingRows.length) {
+    updated = await supabasePatch<StaffMasterRow[]>(
+      env,
+      tableName,
+      `${empColumn}=eq.${encodeURIComponent(emp)}`,
+      record
+    );
+  } else {
+    updated = await supabasePost<StaffMasterRow[]>(
+      env,
+      tableName,
+      record
+    );
+  }
+
+  const row = Array.isArray(updated) && updated[0] ? updated[0] : record;
+
+  return {
+    ok: true,
+    action: "upsertStaffMaster",
+    source: "skhps-backend-supabase",
+    sourceLabel: "Supabase / StaffMaster",
+    env: appEnv,
+    staffTable: tableName,
+    status: existingRows.length ? "updated" : "created",
+    emp,
+    data: normalizeStaffMasterAdminRow(row, tableName)
+  };
+}
+
+async function updateStaffMasterStatus(env: Env, body: any) {
+  const payload = staffMasterPayload(body);
+  const appEnv = normalizeEnv(body.env || payload.env);
+  const tableName = getStaffTable(env);
+  const emp = staffEmpFromPayload(payload);
+
+  if (!emp) {
+    return {
+      ok: false,
+      action: "updateStaffMasterStatus",
+      source: "skhps-backend-supabase",
+      error: "MISSING_EMP",
+      message: "員工編號必填"
+    };
+  }
+
+  const patch = staffPatchFromPayload(payload, { partial: true });
+  delete patch["姓名"];
+  delete patch["員工編號"];
+  delete patch["職級"];
+  delete patch["分組"];
+  delete patch["排序"];
+  delete patch["備註"];
+
+  if (!Object.prototype.hasOwnProperty.call(patch, "啟用") && !Object.prototype.hasOwnProperty.call(patch, "允許快速登入")) {
+    return {
+      ok: false,
+      action: "updateStaffMasterStatus",
+      source: "skhps-backend-supabase",
+      error: "NO_STATUS_FIELD",
+      message: "沒有可更新的狀態欄位"
+    };
+  }
+
+  const empColumn = encodeURIComponent("員工編號");
+  const updated = await supabasePatch<StaffMasterRow[]>(
+    env,
+    tableName,
+    `${empColumn}=eq.${encodeURIComponent(emp)}`,
+    patch
+  );
+
+  if (!updated.length) {
+    return {
+      ok: false,
+      action: "updateStaffMasterStatus",
+      source: "skhps-backend-supabase",
+      error: "STAFF_NOT_FOUND",
+      message: `找不到人員：${emp}`
+    };
+  }
+
+  return {
+    ok: true,
+    action: "updateStaffMasterStatus",
+    source: "skhps-backend-supabase",
+    sourceLabel: "Supabase / StaffMaster",
+    env: appEnv,
+    staffTable: tableName,
+    emp,
+    data: normalizeStaffMasterAdminRow(updated[0], tableName)
+  };
+}
+
+async function reorderStaffMaster(env: Env, body: any) {
+  const payload = staffMasterPayload(body);
+  const appEnv = normalizeEnv(body.env || payload.env);
+  const tableName = getStaffTable(env);
+  const items = Array.isArray(payload.items) ? payload.items as Record<string, unknown>[] : [];
+
+  if (!items.length) {
+    return {
+      ok: false,
+      action: "reorderStaffMaster",
+      source: "skhps-backend-supabase",
+      error: "EMPTY_ITEMS",
+      message: "沒有排序資料"
+    };
+  }
+
+  const empColumn = encodeURIComponent("員工編號");
+  const updated: Record<string, unknown>[] = [];
+
+  for (const item of items) {
+    const emp = staffEmpFromPayload(item);
+    const sortOrder = numberFromUnknown(item.sortOrder || item.sort_order || item["排序"], 999);
+    if (!emp) continue;
+
+    const result = await supabasePatch<StaffMasterRow[]>(
+      env,
+      tableName,
+      `${empColumn}=eq.${encodeURIComponent(emp)}`,
+      {
+        "排序": sortOrder,
+        "更新時間": new Date().toISOString()
+      }
+    );
+
+    if (result[0]) {
+      updated.push(normalizeStaffMasterAdminRow(result[0], tableName));
+    }
+  }
+
+  return {
+    ok: true,
+    action: "reorderStaffMaster",
+    source: "skhps-backend-supabase",
+    sourceLabel: "Supabase / StaffMaster",
+    env: appEnv,
+    staffTable: tableName,
+    count: updated.length,
+    items: updated
+  };
+}
+
+
 
 
 type QrSigninMeetingRow = {
@@ -2304,6 +2634,63 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
   }
 
 
+  if (action === "listStaffMaster") {
+    try {
+      const result = await listStaffMaster(env, body);
+      return json(result);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "upsertStaffMaster") {
+    try {
+      const result = await upsertStaffMaster(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "updateStaffMasterStatus") {
+    try {
+      const result = await updateStaffMasterStatus(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "reorderStaffMaster") {
+    try {
+      const result = await reorderStaffMaster(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+
   if (action === "getQrSigninMeetings") {
     try {
       const result = await getQrSigninMeetings(env, body);
@@ -2424,7 +2811,7 @@ export default {
       return json({
         ok: true,
         service: "skhps-backend",
-        version: "0.1.3-qr-signin-cloudflare-phase1",
+        version: "0.1.4-staffmaster-admin",
         hasSupabaseUrl: !!env.SUPABASE_URL,
         hasSupabaseServiceKey: !!env.SUPABASE_SERVICE_ROLE_KEY,
         upload: {
