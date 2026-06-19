@@ -51,6 +51,10 @@ type ExternalProjectRegistryRow = {
   enabled: boolean;
   show_on_home: boolean | null;
   show_on_backend: boolean | null;
+  show_in_launcher: boolean | null;
+  registry_role: string | null;
+  registry_reason: string | null;
+  default_position: string | null;
   version: string | null;
   version_raw: string | null;
   manifest_url: string | null;
@@ -329,6 +333,10 @@ function normalizeExternalAppRegisterPayload(input: Record<string, unknown>): {
   pageId: string;
   pageTitle: string;
   pageHref: string;
+  showInLauncher: boolean;
+  registryRole: string;
+  registryReason: string;
+  defaultPosition: string;
 } {
   const config = input.config && typeof input.config === "object" ? input.config as Record<string, unknown> : input;
   const appId = firstText(config.appId, config.id, input.appId, input.rootAppId, input.projectId, input.id);
@@ -342,6 +350,28 @@ function normalizeExternalAppRegisterPayload(input: Record<string, unknown>): {
   const pageId = firstText(input.pageId, config.pageId, appId);
   const pageTitle = firstText(input.pageTitle, config.pageTitle, title);
   const pageHref = firstText(input.pageHref, config.pageHref, href);
+  const registryFromInput = input.registry && typeof input.registry === "object" && !Array.isArray(input.registry)
+    ? input.registry as Record<string, unknown>
+    : {};
+  const registryFromConfig = config.registry && typeof config.registry === "object" && !Array.isArray(config.registry)
+    ? config.registry as Record<string, unknown>
+    : {};
+  const registry = {
+    ...registryFromConfig,
+    ...registryFromInput
+  };
+  const rawShowInLauncher =
+    registry.showInLauncher ??
+    input.showInLauncher ??
+    input.show_in_launcher ??
+    input.launcherVisible ??
+    input.visibleInLauncher;
+  const showInLauncher = rawShowInLauncher === undefined || rawShowInLauncher === null || String(rawShowInLauncher).trim() === ""
+    ? input.registerExternalApp === false ? false : true
+    : booleanFromUnknown(rawShowInLauncher);
+  const registryRole = firstText(registry.role, registry.registryRole, input.registryRole, input.registry_role, input.role);
+  const registryReason = firstText(registry.reason, registry.registryReason, registry.hiddenReason, input.registryReason, input.registry_reason, input.reason);
+  const defaultPosition = firstText(registry.defaultPosition, registry.defaultDisplayPosition, registry.displayPosition, registry.position, input.defaultPosition, input.default_position);
 
   return {
     appId,
@@ -354,7 +384,11 @@ function normalizeExternalAppRegisterPayload(input: Record<string, unknown>): {
     description,
     pageId,
     pageTitle,
-    pageHref
+    pageHref,
+    showInLauncher,
+    registryRole,
+    registryReason,
+    defaultPosition
   };
 }
 
@@ -635,6 +669,14 @@ function normalizeRegistryRow(row: ExternalProjectRegistryRow): Record<string, u
     show_on_home: booleanFromUnknown(row.show_on_home),
     showOnBackend: booleanFromUnknown(row.show_on_backend),
     show_on_backend: booleanFromUnknown(row.show_on_backend),
+    showInLauncher: row.show_in_launcher === null || row.show_in_launcher === undefined ? true : booleanFromUnknown(row.show_in_launcher),
+    show_in_launcher: row.show_in_launcher === null || row.show_in_launcher === undefined ? true : booleanFromUnknown(row.show_in_launcher),
+    registryRole: firstText(row.registry_role),
+    registry_role: firstText(row.registry_role),
+    registryReason: firstText(row.registry_reason),
+    registry_reason: firstText(row.registry_reason),
+    defaultPosition: placementLabel(row.default_position),
+    default_position: normalizePlacement(row.default_position),
 
     version,
     versionRaw,
@@ -670,7 +712,13 @@ function normalizeRegistryRow(row: ExternalProjectRegistryRow): Record<string, u
         runtimePanel: booleanFromUnknown(row.features_runtime_panel),
         backendClient: booleanFromUnknown(row.features_backend_client)
       },
-      source: firstText(row.source, "supabase")
+      source: firstText(row.source, "supabase"),
+      registry: {
+        showInLauncher: row.show_in_launcher === null || row.show_in_launcher === undefined ? true : booleanFromUnknown(row.show_in_launcher),
+        role: firstText(row.registry_role),
+        reason: firstText(row.registry_reason),
+        defaultPosition: normalizePlacement(row.default_position)
+      }
     }
   };
 }
@@ -769,6 +817,11 @@ async function registerExternalApp(env: Env, body: any) {
     existing && existing.title,
     projectId
   );
+  const showInLauncher = payload.showInLauncher;
+  const defaultPosition = normalizePlacement(payload.defaultPosition);
+  const initialDisplayPosition = showInLauncher
+    ? (defaultPosition === "hidden" ? existing && existing.display_position ? normalizePlacement(existing.display_position) : "hidden" : defaultPosition)
+    : "hidden";
 
   const record: Record<string, unknown> = {
     registry_key: registryKey,
@@ -779,12 +832,16 @@ async function registerExternalApp(env: Env, body: any) {
     title,
     description: firstText(payload.description, existing && existing.description),
     href,
-    display_position: existing ? normalizePlacement(existing.display_position) : "hidden",
+    display_position: existing ? normalizePlacement(existing.display_position) : initialDisplayPosition,
     group_name: firstText(existing && existing.group_name, payload.group, "院內系統"),
     sort_order: existing ? numberFromUnknown(existing.sort_order, 9999) : 9999,
     enabled: existing ? booleanFromUnknown(existing.enabled) : false,
     show_on_home: existing ? booleanFromUnknown(existing.enabled) && normalizePlacement(existing.display_position) === "frontend" : false,
     show_on_backend: existing ? booleanFromUnknown(existing.enabled) && normalizePlacement(existing.display_position) === "backend" : false,
+    show_in_launcher: showInLauncher,
+    registry_role: payload.registryRole || existing && existing.registry_role || "",
+    registry_reason: payload.registryReason || existing && existing.registry_reason || "",
+    default_position: defaultPosition,
     version: version || existing && existing.version || "",
     version_raw: version ? "" : firstText(existing && existing.version_raw),
     manifest_url: firstText(existing && existing.manifest_url, inferManifestUrl(href)),
@@ -931,6 +988,45 @@ async function updateExternalProjectActivation(env: Env, body: any) {
     patch.href = firstText(payload.href, row.href);
   }
 
+  if (
+    Object.prototype.hasOwnProperty.call(payload, "showInLauncher") ||
+    Object.prototype.hasOwnProperty.call(payload, "show_in_launcher") ||
+    Object.prototype.hasOwnProperty.call(payload, "顯示於啟動器")
+  ) {
+    patch.show_in_launcher = booleanFromUnknown(
+      Object.prototype.hasOwnProperty.call(payload, "showInLauncher") ? payload.showInLauncher :
+        Object.prototype.hasOwnProperty.call(payload, "show_in_launcher") ? payload.show_in_launcher :
+          payload["顯示於啟動器"]
+    );
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(payload, "registryRole") ||
+    Object.prototype.hasOwnProperty.call(payload, "registry_role") ||
+    Object.prototype.hasOwnProperty.call(payload, "role") ||
+    Object.prototype.hasOwnProperty.call(payload, "Registry角色")
+  ) {
+    patch.registry_role = firstText(payload.registryRole, payload.registry_role, payload.role, payload["Registry角色"]);
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(payload, "registryReason") ||
+    Object.prototype.hasOwnProperty.call(payload, "registry_reason") ||
+    Object.prototype.hasOwnProperty.call(payload, "reason") ||
+    Object.prototype.hasOwnProperty.call(payload, "隱藏原因")
+  ) {
+    patch.registry_reason = firstText(payload.registryReason, payload.registry_reason, payload.reason, payload["隱藏原因"]);
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(payload, "defaultPosition") ||
+    Object.prototype.hasOwnProperty.call(payload, "default_position") ||
+    Object.prototype.hasOwnProperty.call(payload, "預設位置") ||
+    Object.prototype.hasOwnProperty.call(payload, "預設顯示位置")
+  ) {
+    patch.default_position = normalizePlacement(firstText(payload.defaultPosition, payload.default_position, payload["預設位置"], payload["預設顯示位置"]));
+  }
+
   if (!Object.keys(patch).length) {
     return {
       ok: false,
@@ -944,8 +1040,11 @@ async function updateExternalProjectActivation(env: Env, body: any) {
   const nextEnabled = Object.prototype.hasOwnProperty.call(patch, "enabled") ? booleanFromUnknown(patch.enabled) : booleanFromUnknown(row.enabled);
   const nextPosition = Object.prototype.hasOwnProperty.call(patch, "display_position") ? normalizePlacement(patch.display_position) : normalizePlacement(row.display_position);
 
-  patch.show_on_home = nextEnabled && nextPosition === "frontend";
-  patch.show_on_backend = nextEnabled && nextPosition === "backend";
+  const nextShowInLauncher = Object.prototype.hasOwnProperty.call(patch, "show_in_launcher") ? booleanFromUnknown(patch.show_in_launcher) :
+    row.show_in_launcher === null || row.show_in_launcher === undefined ? true : booleanFromUnknown(row.show_in_launcher);
+
+  patch.show_on_home = nextShowInLauncher && nextEnabled && nextPosition === "frontend";
+  patch.show_on_backend = nextShowInLauncher && nextEnabled && nextPosition === "backend";
   patch.updated_at = new Date().toISOString();
   patch.source = "backend-project-launcher";
 
