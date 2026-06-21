@@ -1987,6 +1987,9 @@ function qrSigninMeetingDisplay(row: QrSigninMeetingRow): Record<string, unknown
     isRunning,
     selected: isRunning,
     source: row.source,
+    sourceId: row.source_id || "",
+    calendarEventId: row.source_id || "",
+    calendarId: row.calendar_id || "",
     status: row.status,
     enabled: row.enabled
   };
@@ -2076,7 +2079,7 @@ async function syncQrSigninMeetingsFromAppsScript(env: Env, payload: Record<stri
     course: meeting.course || meeting.title,
     date: meeting.date || meeting.time || meeting.timeLabel,
     source: "apps-script-calendar",
-    sourceId: firstText(meeting.id, meeting.eventId, meeting.uid),
+    sourceId: firstText(meeting.calendarEventId, meeting.sourceId, meeting.id, meeting.eventId, meeting.uid),
     metadata: { rawSource: "apps-script", rawMeeting: meeting }
   }));
   const table = getQrSigninMeetingTable(env);
@@ -2154,7 +2157,7 @@ async function createQrSigninMeeting(env: Env, body: any) {
     envName: appEnv,
     course: title,
     date,
-    source: "manual",
+    source: firstText(payload.source) || "manual",
     sourceId: firstText(payload.sourceId) || undefined,
     metadata: { rawPayload: payload }
   });
