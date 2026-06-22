@@ -2224,7 +2224,9 @@ function qrSigninResultFromRecord(row: QrSigninRecordRow, meeting?: QrSigninMeet
     name: row.name,
     employeeId: row.employee_id || "",
     role: row.role || "",
-    signedAt: row.signed_at || row.submitted_at,
+    signedAt: row.submitted_at || row.signed_at,
+    submittedAt: row.submitted_at,
+    recordedSignedAt: row.signed_at || "",
     message: status === "success" ? "簽到成功" : status === "duplicate" ? "你已經簽到過，不需要重複送出" : "簽到失敗"
   };
 }
@@ -2289,7 +2291,7 @@ async function submitQrSignin(env: Env, body: any) {
   const name = firstText(payload.name);
   const employeeId = firstText(payload.employeeId, payload.emp);
   const role = firstText(payload.role);
-  const signedAt = firstText(payload.signedAt, new Date().toISOString());
+  const signedAt = new Date().toISOString();
   const clientRequestId = firstText(payload.clientRequestId);
 
   if (!name || !role) {
@@ -2438,6 +2440,7 @@ async function submitQrSignin(env: Env, body: any) {
     role,
     staff_source: "StaffMaster",
     signed_at: signedAt,
+    submitted_at: signedAt,
     status: statusInfo.status,
     reason: statusInfo.reason || null,
     source: "qr",
@@ -2491,7 +2494,7 @@ async function listQrSigninRecords(env: Env, body: any) {
   const limit = Math.min(Math.max(qrNumberFromEnv(payload.limit, 100), 1), 500);
   const meetingId = firstText(payload.meetingId);
   const table = getQrSigninRecordTable(env);
-  let path = `${encodeURIComponent(table)}?select=*&order=created_at.desc&limit=${limit}`;
+  let path = `${encodeURIComponent(table)}?select=*&order=signed_at.asc.nullslast,submitted_at.asc.nullslast,created_at.asc&limit=${limit}`;
   if (meetingId) path += `&meeting_id=eq.${encodeURIComponent(meetingId)}`;
   const rows = await supabaseGet<QrSigninRecordRow[]>(env, path);
 
