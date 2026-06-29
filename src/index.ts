@@ -1,6 +1,6 @@
 /*
  * 檔案位置：skhps-backend-worker/src/index.ts
- * 時間戳記：2026-06-29 16:23 UTC+8
+ * 時間戳記：2026-06-29 23:19 UTC+8
  * 用途：SKHPS 新後端 Cloudflare Worker。
  *
  * 目前提供：
@@ -12,6 +12,7 @@
  *   - registerExternalApp
  *   - updateExternalProjectActivation / updateExternalAppSettings / setExternalAppActive
  *   - getQuickLoginStaff（讀 Supabase 共用人員主檔 StaffMaster）
+ *   - recordQuickLoginNewStaff（記錄萬用登入未出現在 StaffMaster 的測試帳密）
  *   - listStaffMaster / upsertStaffMaster / updateStaffMasterStatus / reorderStaffMaster（StaffMaster 管理）
  * - POST /api/upload-file
  *
@@ -114,6 +115,7 @@ type WorkerUploadFile = Blob & {
 const DEFAULT_UPLOAD_BUCKET = "skhps-uploads";
 const DEFAULT_UPLOAD_TABLE = "skhps_file_uploads";
 const DEFAULT_STAFF_TABLE = "StaffMaster";
+const DEFAULT_QUICK_LOGIN_NEW_STAFF_TABLE = "NewStaff";
 const DEFAULT_EXTERNAL_PROJECT_TABLE = "ExternalProject";
 const DEFAULT_QR_SIGNIN_MEETING_TABLE = "QrSigninMeeting";
 const DEFAULT_QR_SIGNIN_RECORD_TABLE = "QrSigninRecord";
@@ -1240,8 +1242,32 @@ function getStaffTable(env: Env): string {
   return String(env.SUPABASE_STAFF_TABLE || DEFAULT_STAFF_TABLE).trim() || DEFAULT_STAFF_TABLE;
 }
 
+function getQuickLoginNewStaffTable(): string {
+  return DEFAULT_QUICK_LOGIN_NEW_STAFF_TABLE;
+}
+
+async function getLatestNewStaffPasswordByEmp(env: Env): Promise<Record<string, string>> {
+  const tableName = getQuickLoginNewStaffTable();
+  const rows = await supabaseGet<StaffMasterRow[]>(
+    env,
+    `${encodeURIComponent(tableName)}?select=${encodeURIComponent("員工編號,密碼,新增時間")}&order=${encodeURIComponent("新增時間")}.desc.nullslast`
+  );
+  const latestByEmp: Record<string, string> = {};
+
+  for (const row of rows) {
+    const emp = stringValue(row, ["員工編號", "emp", "employee_id"], "");
+    const password = stringValue(row, ["密碼", "password", "Password", "PassWord"], "");
+    if (emp && password && !latestByEmp[emp]) {
+      latestByEmp[emp] = password;
+    }
+  }
+
+  return latestByEmp;
+}
+
 async function getQuickLoginStaff(env: Env, appEnv: AppEnvName) {
   const tableName = getStaffTable(env);
+  const newStaffTableName = getQuickLoginNewStaffTable();
   /* StaffMaster 也不從 KV 回傳；保留 appEnv 只作診斷。 */
   void appEnv;
 
@@ -1249,9 +1275,33 @@ async function getQuickLoginStaff(env: Env, appEnv: AppEnvName) {
     env,
     `${encodeURIComponent(tableName)}?select=*`
   );
+  let passwordFallbackByEmp: Record<string, string> = {};
+  let passwordFallbackError = "";
+
+  try {
+    passwordFallbackByEmp = await getLatestNewStaffPasswordByEmp(env);
+  } catch (error) {
+    passwordFallbackError = error instanceof Error ? error.message : String(error);
+  }
 
   const staffList = rows
     .map((row) => toQuickLoginPerson(row, tableName))
+    .map((person) => {
+      if (person.password || !person.emp) return person;
+
+      const fallbackPassword = passwordFallbackByEmp[String(person.emp)] || "";
+      if (!fallbackPassword) return person;
+
+      return {
+        ...person,
+        password: fallbackPassword,
+        metadata: {
+          ...(person.metadata || {}),
+          passwordSource: "NewStaff",
+          passwordSourceTable: newStaffTableName
+        }
+      };
+    })
     .filter((person) => person.active && person.allowQuickLogin && person.name && person.emp)
     .sort((a, b) => {
       const orderDiff = Number(a.sortOrder || 999) - Number(b.sortOrder || 999);
@@ -1265,6 +1315,9 @@ async function getQuickLoginStaff(env: Env, appEnv: AppEnvName) {
     source: "skhps-backend-supabase",
     env: appEnv,
     staffTable: tableName,
+    passwordFallbackTable: newStaffTableName,
+    passwordFallbackCount: Object.keys(passwordFallbackByEmp).length,
+    passwordFallbackError,
     count: staffList.length,
     cachedAt: new Date().toISOString(),
     staffList,
@@ -1273,6 +1326,108 @@ async function getQuickLoginStaff(env: Env, appEnv: AppEnvName) {
 
 
   return payload;
+}
+
+async function findQuickLoginNewStaffRowsByEmpAndPassword(env: Env, emp: string, password: string): Promise<StaffMasterRow[]> {
+  const tableName = getQuickLoginNewStaffTable();
+  const empColumn = encodeURIComponent("員工編號");
+  const passwordColumn = encodeURIComponent("密碼");
+
+  return await supabaseGet<StaffMasterRow[]>(
+    env,
+    `${encodeURIComponent(tableName)}?${empColumn}=eq.${encodeURIComponent(emp)}&${passwordColumn}=eq.${encodeURIComponent(password)}&select=*`
+  );
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function formatTaipeiTimestampKey(date = new Date(), offsetSeconds = 0): string {
+  const taipei = new Date(date.getTime() + (8 * 60 * 60 + offsetSeconds) * 1000);
+  return [
+    taipei.getUTCFullYear(),
+    pad2(taipei.getUTCMonth() + 1),
+    pad2(taipei.getUTCDate()),
+    pad2(taipei.getUTCHours()),
+    pad2(taipei.getUTCMinutes()),
+    pad2(taipei.getUTCSeconds())
+  ].join("");
+}
+
+function buildQuickLoginNewStaffRecord(emp: string, password: string, offsetSeconds = 0): Record<string, unknown> {
+  return {
+    "新增時間": formatTaipeiTimestampKey(new Date(), offsetSeconds),
+    "員工編號": emp,
+    "密碼": password
+  };
+}
+
+async function recordQuickLoginNewStaff(env: Env, body: any) {
+  const payload = isPlainObject(body.payload) ? body.payload : body;
+  const tableName = getQuickLoginNewStaffTable();
+  const emp = firstText(payload.emp, payload.account, payload.employeeId, payload.employee_id, payload["員工編號"]);
+  const password = firstText(payload.password, payload.PassWord, payload["密碼"]);
+
+  if (!emp) {
+    return {
+      ok: false,
+      action: "recordQuickLoginNewStaff",
+      source: "skhps-backend-supabase",
+      error: "MISSING_EMP",
+      message: "員工編號必填"
+    };
+  }
+
+  const existingRows = await findQuickLoginNewStaffRowsByEmpAndPassword(env, emp, password);
+
+  if (existingRows.length) {
+    return {
+      ok: true,
+      action: "recordQuickLoginNewStaff",
+      source: "skhps-backend-supabase",
+      sourceLabel: "Supabase / NewStaff",
+      table: tableName,
+      emp,
+      mode: "skipped-existing",
+      count: 0
+    };
+  }
+
+  let inserted: StaffMasterRow[] = [];
+  let insertedAt = "";
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const record = buildQuickLoginNewStaffRecord(emp, password, attempt);
+    insertedAt = String(record["新增時間"] || "");
+
+    try {
+      inserted = await supabasePost<StaffMasterRow[]>(
+        env,
+        tableName,
+        record
+      );
+      break;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (attempt < 5 && message.indexOf("NewStaff_pkey") >= 0) {
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  return {
+    ok: true,
+    action: "recordQuickLoginNewStaff",
+    source: "skhps-backend-supabase",
+    sourceLabel: "Supabase / NewStaff",
+    table: tableName,
+    emp,
+    insertedAt,
+    mode: "inserted",
+    count: Array.isArray(inserted) ? inserted.length : 0
+  };
 }
 
 function staffMasterPayload(body: any): Record<string, unknown> {
@@ -2761,6 +2916,20 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
       const appEnv = normalizeEnv(body.env || body.payload?.env);
       const result = await getQuickLoginStaff(env, appEnv);
       return json(result);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "recordQuickLoginNewStaff") {
+    try {
+      const result = await recordQuickLoginNewStaff(env, body);
+      return json(result, result.ok === false ? 400 : 200);
     } catch (error) {
       return json({
         ok: false,
