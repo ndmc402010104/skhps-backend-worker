@@ -1,6 +1,6 @@
 /*
  * 檔案位置：skhps-backend-worker/src/index.ts
- * 時間戳記：2026-06-19 00:42 UTC+8
+ * 時間戳記：2026-06-29 16:23 UTC+8
  * 用途：SKHPS 新後端 Cloudflare Worker。
  *
  * 目前提供：
@@ -1202,6 +1202,7 @@ function toQuickLoginPerson(row: StaffMasterRow, tableName: string) {
   const emp = stringValue(row, ["員工編號", "staff_code", "emp", "employee_id", "staff_id"]);
   const role = metadataString(row, metadata, ["職級", "role", "title"], "");
   const group = metadataString(row, metadata, ["分組", "group_key", "group"], "");
+  const password = stringValue(row, ["密碼", "password", "Password", "PassWord"], "");
   const note = metadataString(row, metadata, ["備註", "note"], "");
   const sortOrder = numberValue(row, ["排序", "sort_order", "sortOrder"], 999);
   const updatedAt = stringValue(row, ["更新時間", "updated_at", "updatedAt"], "");
@@ -1216,6 +1217,7 @@ function toQuickLoginPerson(row: StaffMasterRow, tableName: string) {
     role,
     title: role,
     group,
+    password,
     sortOrder,
     sort_order: sortOrder,
     active,
