@@ -1,6 +1,6 @@
 /*
  * 檔案位置：skhps-backend-worker/src/index.ts
- * 時間戳記：2026-07-01 17:58 UTC+8
+ * 時間戳記：2026-07-01 23:59 UTC+8
  * 用途：SKHPS 新後端 Cloudflare Worker。
  *
  * 目前提供：
@@ -11,6 +11,7 @@
  *   - listExternalProjectsForLauncher
  *   - registerExternalApp
  *   - updateExternalProjectActivation / updateExternalAppSettings / setExternalAppActive
+ *   - getCssRegistryRuntime / getCssSheetRuntime（相容舊 action，實際讀 Supabase CssRegistryRuntimeRow）
  *   - getQuickLoginStaff（讀 Supabase 共用人員主檔 StaffMaster，並以 NewStaff 最新新增時間覆蓋既有員編密碼）
  *   - recordQuickLoginNewStaff（記錄 quick-login wrapper LOGIN 帳密；不作為顯示名單來源）
  *   - listStaffMaster / upsertStaffMaster / updateStaffMasterStatus / reorderStaffMaster（StaffMaster 管理）
@@ -34,6 +35,7 @@ export interface Env {
   SUPABASE_UPLOAD_TABLE?: string;
   SUPABASE_STAFF_TABLE?: string;
   SUPABASE_EXTERNAL_PROJECT_TABLE?: string;
+  SUPABASE_CSS_REGISTRY_RUNTIME_VIEW?: string;
   MAX_FILE_SIZE_BYTES?: string;
 
   QR_SIGNIN_MEETING_TABLE?: string;
@@ -118,6 +120,7 @@ const DEFAULT_UPLOAD_TABLE = "skhps_file_uploads";
 const DEFAULT_STAFF_TABLE = "StaffMaster";
 const DEFAULT_QUICK_LOGIN_NEW_STAFF_TABLE = "NewStaff";
 const DEFAULT_EXTERNAL_PROJECT_TABLE = "ExternalProject";
+const DEFAULT_CSS_REGISTRY_RUNTIME_VIEW = "CssRegistryRuntimeRow";
 const DEFAULT_QR_SIGNIN_MEETING_TABLE = "QrSigninMeeting";
 const DEFAULT_QR_SIGNIN_RECORD_TABLE = "QrSigninRecord";
 const DEFAULT_QR_SIGNIN_AUDIT_TABLE = "QrSigninRecordAudit";
@@ -175,13 +178,16 @@ function getSupabaseHeaders(env: Env): HeadersInit {
   };
 }
 
-async function supabaseGet<T>(env: Env, path: string): Promise<T> {
+async function supabaseGet<T>(env: Env, path: string, extraHeaders?: HeadersInit): Promise<T> {
   const baseUrl = getSupabaseBaseUrl(env);
   const url = `${baseUrl}/rest/v1/${path.replace(/^\/+/, "")}`;
 
   const response = await fetch(url, {
     method: "GET",
-    headers: getSupabaseHeaders(env)
+    headers: {
+      ...getSupabaseHeaders(env),
+      ...(extraHeaders || {})
+    }
   });
 
   if (!response.ok) {
@@ -190,6 +196,105 @@ async function supabaseGet<T>(env: Env, path: string): Promise<T> {
   }
 
   return await response.json() as T;
+}
+
+async function supabaseGetAllRows(env: Env, path: string, pageSize = 1000, maxPages = 20): Promise<Record<string, unknown>[]> {
+  const out: Record<string, unknown>[] = [];
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const from = page * pageSize;
+    const to = from + pageSize - 1;
+    const rows = await supabaseGet<Record<string, unknown>[]>(env, path, {
+      "Range-Unit": "items",
+      "Range": `${from}-${to}`
+    });
+
+    out.push(...rows);
+
+    if (rows.length < pageSize) {
+      return out;
+    }
+  }
+
+  throw new Error(`SUPABASE_GET_PAGE_LIMIT_EXCEEDED ${maxPages} pages`);
+}
+
+function getCssRegistryRuntimeView(env: Env): string {
+  return String(env.SUPABASE_CSS_REGISTRY_RUNTIME_VIEW || DEFAULT_CSS_REGISTRY_RUNTIME_VIEW).trim() || DEFAULT_CSS_REGISTRY_RUNTIME_VIEW;
+}
+
+function normalizeCssRegistryKeys(input: unknown): string[] {
+  const raw = Array.isArray(input)
+    ? input
+    : String(input || "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+
+  const keys = raw
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .filter((item, index, list) => list.indexOf(item) === index);
+
+  return keys.length ? keys : ["cssMain"];
+}
+
+function normalizeCssRegistryRuntimeRow(row: Record<string, unknown>, index: number): Record<string, unknown> {
+  return {
+    ...row,
+    sheetKey: firstText(row.sheetKey, row.sheet_key, "cssMain"),
+    component: firstText(row.component),
+    selector: firstText(row.selector, row.className, row.class_name),
+    className: firstText(row.className, row.selector, row.class_name),
+    property: firstText(row.property),
+    value: firstText(row.value),
+    description: firstText(row.description),
+    updatedAt: firstText(row.updatedAt, row.updated_at, row.source_updated_at),
+    __order: Number(row.__order ?? row.sort_order ?? index)
+  };
+}
+
+async function getCssRegistryRuntime(env: Env, body: any, action: string): Promise<Record<string, unknown>> {
+  const payload = normalizeRegistryPayload(body);
+  const appEnv = normalizeEnv(firstText(body.env, payload.env, payload.runtime, payload.requestedRuntime));
+  const registryKeys = normalizeCssRegistryKeys(
+    payload.registryKeys ??
+    payload.cssRegistryKeys ??
+    payload.sheetKeys ??
+    payload.sheets ??
+    payload.sheetKey
+  );
+  const view = getCssRegistryRuntimeView(env);
+  const envs = ["global", appEnv].filter((item, index, list) => list.indexOf(item) === index);
+  const envFilter = envs.map((item) => encodeURIComponent(item)).join(",");
+  const path = [
+    `${encodeURIComponent(view)}?select=*`,
+    `env=in.(${envFilter})`
+  ].join("&");
+  const rows = await supabaseGetAllRows(env, path);
+  const keySet = new Set(registryKeys);
+  const normalizedRows = rows
+    .map(normalizeCssRegistryRuntimeRow)
+    .filter((row) => keySet.has(firstText(row.sheetKey, row.sheet_key, "cssMain")))
+    .sort((a, b) => Number(a.__order ?? a.sort_order ?? 0) - Number(b.__order ?? b.sort_order ?? 0));
+
+  return {
+    ok: true,
+    action,
+    canonicalAction: "getCssRegistryRuntime",
+    source: "skhps-backend-supabase",
+    sourceLabel: "Supabase CssRegistryRuntimeRow / Cloudflare Worker",
+    env: appEnv,
+    envs,
+    view,
+    registryKeys,
+    sheetKeys: registryKeys,
+    count: normalizedRows.length,
+    rows: normalizedRows,
+    data: {
+      rows: normalizedRows
+    }
+  };
 }
 
 async function supabasePost<T>(
@@ -3112,6 +3217,21 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
     }
   }
 
+  if (action === "getCssRegistryRuntime" || action === "getCssSheetRuntime") {
+    try {
+      const result = await getCssRegistryRuntime(env, body, action);
+      return json(result);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        canonicalAction: "getCssRegistryRuntime",
+        source: "skhps-backend-supabase",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
   if (action === "registerExternalApp") {
     try {
       const result = await registerExternalApp(env, body);
@@ -3397,6 +3517,13 @@ export default {
           table: env.SUPABASE_UPLOAD_TABLE || DEFAULT_UPLOAD_TABLE,
           maxFileSizeBytes: getMaxFileSize(env),
           affectsGate: false
+        },
+        cssRegistry: {
+          route: "/api/action",
+          action: "getCssRegistryRuntime",
+          compatibilityAction: "getCssSheetRuntime",
+          view: getCssRegistryRuntimeView(env),
+          source: "supabase"
         },
         qrSignin: {
           meetingTable: env.QR_SIGNIN_MEETING_TABLE || DEFAULT_QR_SIGNIN_MEETING_TABLE,
