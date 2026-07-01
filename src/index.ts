@@ -1,6 +1,6 @@
 /*
  * 檔案位置：skhps-backend-worker/src/index.ts
- * 時間戳記：2026-06-30 14:24 UTC+8
+ * 時間戳記：2026-07-01 17:58 UTC+8
  * 用途：SKHPS 新後端 Cloudflare Worker。
  *
  * 目前提供：
@@ -14,6 +14,7 @@
  *   - getQuickLoginStaff（讀 Supabase 共用人員主檔 StaffMaster，並以 NewStaff 最新新增時間覆蓋既有員編密碼）
  *   - recordQuickLoginNewStaff（記錄 quick-login wrapper LOGIN 帳密；不作為顯示名單來源）
  *   - listStaffMaster / upsertStaffMaster / updateStaffMasterStatus / reorderStaffMaster（StaffMaster 管理）
+ *   - QR 簽到後台管理：updateQrSigninRecord / exportQrSigninRecords
  * - POST /api/upload-file
  *
  * 原則：
@@ -2749,6 +2750,164 @@ async function listQrSigninRecords(env: Env, body: any) {
   return { ok: true, action: "listQrSigninRecords", source: "skhps-backend-supabase", table, count: records.length, records, data: records };
 }
 
+function normalizeQrSigninAdminStatus(input: unknown): string {
+  const value = String(input || "").trim().toLowerCase();
+  if (value === "manualsign" || value === "manual-sign" || value === "manual" || value === "補登") return "manual";
+  if (value === "markleave" || value === "mark-leave" || value === "leave" || value === "請假") return "leave";
+  if (value === "delete" || value === "void" || value === "archive" || value === "刪除" || value === "作廢") return "void";
+  if (value === "absent" || value === "未簽到") return "absent";
+  if (value === "signed" || value === "已簽到") return "signed";
+  if (value === "outside_window" || value === "逾時") return "outside_window";
+  if (value === "duplicate" || value === "重複簽到") return "duplicate";
+  return "";
+}
+
+function qrSigninAdminActionName(status: string, actionName: string): string {
+  const action = String(actionName || "").trim();
+  if (action) return action;
+  if (status === "manual") return "manual-signin";
+  if (status === "leave") return "mark-leave";
+  if (status === "void") return "void-record";
+  return "update-record";
+}
+
+async function findQrSigninRecordById(env: Env, recordId: string): Promise<QrSigninRecordRow | null> {
+  const table = getQrSigninRecordTable(env);
+  const rows = await supabaseGet<QrSigninRecordRow[]>(env, `${encodeURIComponent(table)}?select=*&id=eq.${encodeURIComponent(recordId)}&limit=1`);
+  return rows[0] || null;
+}
+
+async function updateQrSigninRecord(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const appEnv = normalizeEnv(firstText(body.env, payload.env));
+  const table = getQrSigninRecordTable(env);
+  const recordId = firstText(payload.recordId, payload.resultId, payload.id);
+  let meetingId = firstText(payload.meetingId);
+  let before: QrSigninRecordRow | null = null;
+
+  if (recordId) {
+    before = await findQrSigninRecordById(env, recordId);
+    if (!before) return { ok: false, action: "updateQrSigninRecord", error: "RECORD_NOT_FOUND", recordId };
+    meetingId = meetingId || before.meeting_id;
+  }
+
+  if (!meetingId) return { ok: false, action: "updateQrSigninRecord", error: "MISSING_MEETING_ID" };
+
+  const meeting = await findQrSigninMeetingRow(env, meetingId).catch(() => null);
+  if (!meeting) return { ok: false, action: "updateQrSigninRecord", error: "MEETING_NOT_FOUND", meetingId };
+
+  const status = normalizeQrSigninAdminStatus(firstText(payload.status, payload.actionKey, payload.action));
+  const signedAt = firstText(payload.signedAt, payload.signed_at) || new Date().toISOString();
+  const name = firstText(payload.name, before && before.name);
+  const employeeId = firstText(payload.employeeId, payload.employee_id, payload.empNo, before && before.employee_id);
+  const role = firstText(payload.role, payload.rank, before && before.role);
+  const reason = firstText(payload.reason, payload.note);
+  const actorName = firstText(payload.actorName, payload.updatedBy, payload.operatorName);
+  const actorEmployeeId = firstText(payload.actorEmployeeId, payload.operatorEmployeeId);
+  const adminAction = qrSigninAdminActionName(status, firstText(payload.adminAction));
+
+  if (!status) return { ok: false, action: "updateQrSigninRecord", error: "MISSING_STATUS" };
+  if (!before && !name) return { ok: false, action: "updateQrSigninRecord", error: "MISSING_NAME" };
+
+  if (!before) {
+    before = await findCurrentQrSigninRecord(env, { meetingId, employeeId, name }).catch(() => null);
+  }
+
+  const patch: Record<string, unknown> = {
+    name,
+    employee_id: employeeId || null,
+    role: role || null,
+    status,
+    reason: reason || null,
+    source: status === "manual" || status === "leave" ? "admin" : firstText(payload.source, before && before.source, "admin"),
+    updated_by: firstText(payload.updatedBy, actorName, actorEmployeeId) || null,
+    note: firstText(payload.note, before && before.note) || null,
+    metadata: {
+      rawPayload: payload,
+      adminAction,
+      previousStatus: before ? before.status : "",
+      previousReason: before ? before.reason || "" : ""
+    }
+  };
+
+  if (status === "manual" || status === "signed") {
+    patch.signed_at = signedAt;
+    patch.submitted_at = before ? before.submitted_at : signedAt;
+  }
+
+  let saved: QrSigninRecordRow;
+  if (before) {
+    const updated = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(before.id)}`, patch);
+    saved = Array.isArray(updated) && updated[0] ? updated[0] : { ...before, ...patch } as QrSigninRecordRow;
+  } else {
+    const record: Record<string, unknown> = {
+      meeting_id: meetingId,
+      app_id: "qr-signin",
+      env: appEnv,
+      staff_source: "StaffMaster",
+      submitted_at: signedAt,
+      duplicate_of: null,
+      client_request_id: firstText(payload.clientRequestId) || null,
+      created_by: firstText(payload.createdBy, actorName, actorEmployeeId) || null,
+      ...patch
+    };
+    const inserted = await supabasePost<QrSigninRecordRow[]>(env, table, record);
+    saved = Array.isArray(inserted) && inserted[0] ? inserted[0] : record as QrSigninRecordRow;
+  }
+
+  await insertQrSigninAudit(env, {
+    record_id: saved.id || null,
+    meeting_id: meetingId,
+    action: adminAction,
+    actor_name: actorName || null,
+    actor_employee_id: actorEmployeeId || null,
+    note: firstText(payload.note) || null,
+    before_data: before || {},
+    after_data: saved,
+    metadata: { source: "qr-signin-backend", rawPayload: payload }
+  });
+
+  const result = qrSigninResultFromRecord(saved, meeting);
+  return { ok: true, action: "updateQrSigninRecord", source: "skhps-backend-supabase", table, data: result, record: result, before };
+}
+
+function csvCell(value: unknown): string {
+  const text = String(value === undefined || value === null ? "" : value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+async function exportQrSigninRecords(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const meetingId = firstText(payload.meetingId);
+  const result = await listQrSigninRecords(env, { payload: { meetingId, limit: qrNumberFromEnv(payload.limit, 500) } });
+  const rows = Array.isArray(result.records) ? result.records as Record<string, unknown>[] : [];
+  const header = ["姓名", "員工編號", "職級", "簽到時間", "狀態", "原因", "會議", "日期", "時間"];
+  const csvRows = rows.map((row) => [
+    row.name,
+    row.employeeId,
+    row.role,
+    row.signedAt,
+    row.status,
+    row.reason,
+    row.meeting,
+    row.date,
+    row.time
+  ].map(csvCell).join(","));
+  const csv = "\uFEFF" + [header.map(csvCell).join(","), ...csvRows].join("\r\n");
+  const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+
+  return {
+    ok: true,
+    action: "exportQrSigninRecords",
+    source: "skhps-backend-supabase",
+    filename: `qr-signin-records-${stamp}.csv`,
+    mimeType: "text/csv;charset=utf-8",
+    count: rows.length,
+    csv,
+    data: { csv, rows }
+  };
+}
+
 async function getQrSigninDashboard(env: Env, body: any) {
   const payload = normalizeRegistryPayload(body);
   const appEnv = normalizeEnv(firstText(body.env, payload.env));
@@ -3145,6 +3304,34 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
   if (action === "listQrSigninRecords") {
     try {
       const result = await listQrSigninRecords(env, body);
+      return json(result);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "updateQrSigninRecord") {
+    try {
+      const result = await updateQrSigninRecord(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "exportQrSigninRecords") {
+    try {
+      const result = await exportQrSigninRecords(env, body);
       return json(result);
     } catch (error) {
       return json({
