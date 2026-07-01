@@ -6,7 +6,15 @@
 
 begin;
 
-create or replace view public."CssRegistryRuntimeRow" as
+/*
+ * create or replace view 只能在尾端加欄位，不能改動既有欄位的名字/順序。
+ * 這次要把 sheetKey 挪到後面、中間插入 sheet_key 等 snake_case 欄位，屬於結構性變更，
+ * 所以改成 drop + create，而不是 create or replace（實測 2026-07-02：
+ * create or replace 會噴 42P16 cannot change name of view column "sheetKey" to "sheet_key"）。
+ */
+drop view if exists public."CssRegistryRuntimeRow";
+
+create view public."CssRegistryRuntimeRow" as
 with ranked as (
   select
     r.*,

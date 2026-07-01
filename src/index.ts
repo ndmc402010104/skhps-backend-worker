@@ -12,6 +12,7 @@
  *   - registerExternalApp
  *   - updateExternalProjectActivation / updateExternalAppSettings / setExternalAppActive
  *   - getCssRegistryRuntime / getCssSheetRuntime（相容舊 action，實際讀 Supabase CssRegistryRuntimeRow）
+ *   - saveCssSheetRows（CSS Setting Studio 存檔，寫回 Supabase CssRegistryRule，layer 固定 override / env 固定 global；Google Sheet 已 retire，不再 dual-write）
  *   - getQuickLoginStaff（讀 Supabase 共用人員主檔 StaffMaster，並以 NewStaff 最新新增時間覆蓋既有員編密碼）
  *   - recordQuickLoginNewStaff（記錄 quick-login wrapper LOGIN 帳密；不作為顯示名單來源）
  *   - listStaffMaster / upsertStaffMaster / updateStaffMasterStatus / reorderStaffMaster（StaffMaster 管理）
@@ -294,6 +295,113 @@ async function getCssRegistryRuntime(env: Env, body: any, action: string): Promi
     data: {
       rows: normalizedRows
     }
+  };
+}
+
+function normalizeCssSheetSaveRow(row: any): {
+  component: string;
+  selector: string;
+  property: string;
+  value: string;
+  description: string;
+} {
+  return {
+    component: firstText(row && row.component),
+    selector: firstText(row && row.className, row && row.selector),
+    property: firstText(row && row.property),
+    value: firstText(row && row.value),
+    description: firstText(row && row.description)
+  };
+}
+
+/*
+ * CSS Setting Studio 存檔目標。Google Sheet 已 retire，這是唯一的寫入路徑。
+ * 固定寫 env=global / layer=override，對應舊 Sheet 時代「目前值」那一列（不是 default 列）。
+ * sort_order 沿用既有列的值，避免每次存檔都把排序打回 0。
+ */
+async function saveCssRegistryRows(env: Env, body: any): Promise<Record<string, unknown>> {
+  const payload = normalizeRegistryPayload(body);
+  const sheetKey = firstText(payload.sheetKey, payload.tabKey, "cssMain");
+  const inputRows = Array.isArray(payload.rows) ? payload.rows : [];
+
+  const rows = inputRows
+    .map(normalizeCssSheetSaveRow)
+    .filter((row) => row.component && row.selector && row.property && row.value !== "");
+
+  if (!rows.length) {
+    return {
+      ok: false,
+      action: "saveCssSheetRows",
+      canonicalAction: "saveCssRegistryRows",
+      source: "skhps-backend-supabase",
+      error: "NO_ROWS",
+      message: "沒有可儲存的 CSS 列"
+    };
+  }
+
+  const table = "CssRegistryRule";
+  const components = rows
+    .map((row) => row.component)
+    .filter((item, index, list) => list.indexOf(item) === index);
+  const componentFilter = components.map((item) => encodeURIComponent(item)).join(",");
+
+  const existingRows = await supabaseGetAllRows(
+    env,
+    `${encodeURIComponent(table)}?env=eq.global&layer=eq.override&component=in.(${componentFilter})&select=component,selector,property,sort_order`
+  );
+
+  const sortOrderKey = (component: string, selector: string, property: string) =>
+    `${component} ${selector} ${property}`;
+
+  const existingSortOrder = new Map<string, number>();
+  existingRows.forEach((row) => {
+    existingSortOrder.set(
+      sortOrderKey(String(row.component), String(row.selector), String(row.property)),
+      Number(row.sort_order ?? 0)
+    );
+  });
+
+  const nowIso = new Date().toISOString();
+  let updatedCount = 0;
+
+  const records = rows.map((row) => {
+    const key = sortOrderKey(row.component, row.selector, row.property);
+    const isExisting = existingSortOrder.has(key);
+    if (isExisting) updatedCount += 1;
+
+    return {
+      env: "global",
+      sheet_key: sheetKey,
+      component: row.component,
+      selector: row.selector,
+      property: row.property,
+      value: row.value,
+      description: row.description,
+      source_updated_at: nowIso,
+      layer: "override",
+      enabled: true,
+      sort_order: existingSortOrder.get(key) ?? 0,
+      source: "css-setting-studio"
+    };
+  });
+
+  await supabaseUpsert<Record<string, unknown>[]>(
+    env,
+    table,
+    records,
+    "env,layer,component,selector,property"
+  );
+
+  return {
+    ok: true,
+    action: "saveCssSheetRows",
+    canonicalAction: "saveCssRegistryRows",
+    source: "skhps-backend-supabase",
+    sourceLabel: "Supabase CssRegistryRule / Cloudflare Worker",
+    sheetKey,
+    insertedRows: records.length - updatedCount,
+    updatedRows: updatedCount,
+    updatedAt: nowIso
   };
 }
 
@@ -3226,6 +3334,21 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
         ok: false,
         action,
         canonicalAction: "getCssRegistryRuntime",
+        source: "skhps-backend-supabase",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "saveCssSheetRows") {
+    try {
+      const result = await saveCssRegistryRows(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        canonicalAction: "saveCssRegistryRows",
         source: "skhps-backend-supabase",
         error: error instanceof Error ? error.message : String(error)
       }, 500);
