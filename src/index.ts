@@ -1,6 +1,6 @@
 /*
  * 檔案位置：skhps-backend-worker/src/index.ts
- * 時間戳記：2026-07-01 23:59 UTC+8
+ * 時間戳記：2026-07-02 11:25 UTC+8
  * 用途：SKHPS 新後端 Cloudflare Worker。
  *
  * 目前提供：
@@ -13,6 +13,7 @@
  *   - updateExternalProjectActivation / updateExternalAppSettings / setExternalAppActive
  *   - getCssRegistryRuntime / getCssSheetRuntime（相容舊 action，實際讀 Supabase CssRegistryRuntimeRow）
  *   - saveCssSheetRows（CSS Setting Studio 存檔，寫回 Supabase CssRegistryRule，layer 固定 override / env 固定 global；Google Sheet 已 retire，不再 dual-write）
+ *   - deleteCssRegistryRows（精準刪除 Supabase CssRegistryRule 測試/維護列）
  *   - getQuickLoginStaff（讀 Supabase 共用人員主檔 StaffMaster，並以 NewStaff 最新新增時間覆蓋既有員編密碼）
  *   - recordQuickLoginNewStaff（記錄 quick-login wrapper LOGIN 帳密；不作為顯示名單來源）
  *   - listStaffMaster / upsertStaffMaster / updateStaffMasterStatus / reorderStaffMaster（StaffMaster 管理）
@@ -314,6 +315,16 @@ function normalizeCssSheetSaveRow(row: any): {
   };
 }
 
+function normalizeCssRegistrySource(input: unknown): string {
+  const text = firstText(input)
+    .replace(/[^a-zA-Z0-9._:-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+
+  return text || "css-setting-studio";
+}
+
 /*
  * CSS Setting Studio 存檔目標。Google Sheet 已 retire，這是唯一的寫入路徑。
  * 固定寫 env=global / layer=override，對應舊 Sheet 時代「目前值」那一列（不是 default 列）。
@@ -322,6 +333,7 @@ function normalizeCssSheetSaveRow(row: any): {
 async function saveCssRegistryRows(env: Env, body: any): Promise<Record<string, unknown>> {
   const payload = normalizeRegistryPayload(body);
   const sheetKey = firstText(payload.sheetKey, payload.tabKey, "cssMain");
+  const source = normalizeCssRegistrySource(payload.source);
   const inputRows = Array.isArray(payload.rows) ? payload.rows : [];
 
   const rows = inputRows
@@ -381,7 +393,7 @@ async function saveCssRegistryRows(env: Env, body: any): Promise<Record<string, 
       layer: "override",
       enabled: true,
       sort_order: existingSortOrder.get(key) ?? 0,
-      source: "css-setting-studio"
+      source
     };
   });
 
@@ -398,10 +410,82 @@ async function saveCssRegistryRows(env: Env, body: any): Promise<Record<string, 
     canonicalAction: "saveCssRegistryRows",
     source: "skhps-backend-supabase",
     sourceLabel: "Supabase CssRegistryRule / Cloudflare Worker",
+    registrySource: source,
     sheetKey,
     insertedRows: records.length - updatedCount,
     updatedRows: updatedCount,
     updatedAt: nowIso
+  };
+}
+
+function cssRegistryDeleteRowsFromPayload(payload: any): {
+  component: string;
+  selector: string;
+  property: string;
+  source: string;
+}[] {
+  const inputRows = Array.isArray(payload.rows) ? payload.rows : [payload];
+
+  return inputRows
+    .map((row: any) => ({
+      component: firstText(row && row.component),
+      selector: firstText(row && row.className, row && row.selector),
+      property: firstText(row && row.property),
+      source: firstText(row && row.source)
+    }))
+    .filter((row: {
+      component: string;
+      selector: string;
+      property: string;
+      source: string;
+    }) => row.component && row.selector && row.property);
+}
+
+async function deleteCssRegistryRows(env: Env, body: any): Promise<Record<string, unknown>> {
+  const payload = normalizeRegistryPayload(body);
+  const rows = cssRegistryDeleteRowsFromPayload(payload);
+
+  if (!rows.length) {
+    return {
+      ok: false,
+      action: "deleteCssRegistryRows",
+      source: "skhps-backend-supabase",
+      error: "NO_ROWS",
+      message: "缺少可刪除的 CSS registry key：component + className/selector + property"
+    };
+  }
+
+  const table = "CssRegistryRule";
+  let deletedRows = 0;
+
+  for (const row of rows) {
+    const filters = [
+      "env=eq.global",
+      "layer=eq.override",
+      `component=eq.${encodeURIComponent(row.component)}`,
+      `selector=eq.${encodeURIComponent(row.selector)}`,
+      `property=eq.${encodeURIComponent(row.property)}`
+    ];
+
+    if (row.source) {
+      filters.push(`source=eq.${encodeURIComponent(row.source)}`);
+    }
+
+    const deleted = await supabaseDelete<Record<string, unknown>[]>(
+      env,
+      table,
+      filters.join("&")
+    );
+
+    deletedRows += Array.isArray(deleted) ? deleted.length : 0;
+  }
+
+  return {
+    ok: true,
+    action: "deleteCssRegistryRows",
+    source: "skhps-backend-supabase",
+    sourceLabel: "Supabase CssRegistryRule / Cloudflare Worker",
+    deletedRows
   };
 }
 
@@ -459,6 +543,36 @@ async function supabasePatch<T>(
 
   if (!response.ok) {
     throw new Error(`SUPABASE_PATCH_FAILED ${response.status} ${text}`);
+  }
+
+  try {
+    return text ? JSON.parse(text) as T : ([] as T);
+  } catch {
+    return [{ raw: text }] as T;
+  }
+}
+
+async function supabaseDelete<T>(
+  env: Env,
+  table: string,
+  query: string
+): Promise<T> {
+  const baseUrl = getSupabaseBaseUrl(env);
+  const safeTable = table.replace(/^\/+/, "");
+  const safeQuery = query.replace(/^\?+/, "");
+
+  const response = await fetch(`${baseUrl}/rest/v1/${safeTable}?${safeQuery}`, {
+    method: "DELETE",
+    headers: {
+      ...getSupabaseHeaders(env),
+      "Prefer": "return=representation"
+    }
+  });
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`SUPABASE_DELETE_FAILED ${response.status} ${text}`);
   }
 
   try {
@@ -3349,6 +3463,20 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
         ok: false,
         action,
         canonicalAction: "saveCssRegistryRows",
+        source: "skhps-backend-supabase",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "deleteCssRegistryRows") {
+    try {
+      const result = await deleteCssRegistryRows(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
         source: "skhps-backend-supabase",
         error: error instanceof Error ? error.message : String(error)
       }, 500);
