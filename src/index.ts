@@ -2193,6 +2193,8 @@ type QrSigninMeetingRow = {
   updated_by: string | null;
   notes: string | null;
   metadata: Record<string, unknown> | null;
+  host_record_id: string | null;
+  recorder_record_id: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -2541,6 +2543,9 @@ function qrSigninMeetingDisplay(row: QrSigninMeetingRow): Record<string, unknown
   const isRunning = Number.isFinite(startsAt) && Number.isFinite(endsAt)
     ? now >= startsAt - Number(row.open_before_minutes || 0) * 60000 && now <= endsAt + Number(row.close_after_minutes || 0) * 60000
     : false;
+  const singleSelects: Record<string, string> = {};
+  if (row.host_record_id) singleSelects.host = row.host_record_id;
+  if (row.recorder_record_id) singleSelects.recorder = row.recorder_record_id;
 
   return {
     id: row.id,
@@ -2559,7 +2564,14 @@ function qrSigninMeetingDisplay(row: QrSigninMeetingRow): Record<string, unknown
     calendarEventId: row.source_id || "",
     calendarId: row.calendar_id || "",
     status: row.status,
-    enabled: row.enabled
+    enabled: row.enabled,
+    metadata: row.metadata || {},
+    hostRecordId: row.host_record_id || "",
+    recorderRecordId: row.recorder_record_id || "",
+    selectionState: {
+      singleSelects,
+      multiSelects: {}
+    }
   };
 }
 
@@ -2726,8 +2738,7 @@ async function createQrSigninMeeting(env: Env, body: any) {
     course: title,
     date,
     source: firstText(payload.source) || "manual",
-    sourceId: firstText(payload.sourceId) || undefined,
-    metadata: { rawPayload: payload }
+    sourceId: firstText(payload.sourceId) || undefined
   });
 
   const table = getQrSigninMeetingTable(env);
@@ -2756,6 +2767,103 @@ async function getQrSigninMeeting(env: Env, body: any) {
 
   const meeting = qrSigninMeetingDisplay(rows[0]);
   return { ok: true, action: "getQrSigninMeeting", source: "skhps-backend-supabase", table, data: { ok: true, meeting }, meeting };
+}
+
+function normalizeSwipeSelectionPayload(input: unknown): {
+  singleSelects: Record<string, string>;
+} {
+  const source = input && typeof input === "object" ? input as Record<string, unknown> : {};
+  const singleSource = source.singleSelects && typeof source.singleSelects === "object"
+    ? source.singleSelects as Record<string, unknown>
+    : {};
+  const singleSelects: Record<string, string> = {};
+
+  Object.keys(singleSource).forEach((key) => {
+    const cleanKey = String(key || "").trim();
+    const rowId = firstText(singleSource[key]);
+    if (cleanKey && rowId) singleSelects[cleanKey] = rowId;
+  });
+
+  return { singleSelects };
+}
+
+async function findQrSigninRecordInMeeting(env: Env, meetingId: string, recordId: string): Promise<QrSigninRecordRow | null> {
+  if (!meetingId || !recordId) return null;
+  const table = getQrSigninRecordTable(env);
+  const rows = await supabaseGet<QrSigninRecordRow[]>(
+    env,
+    `${encodeURIComponent(table)}?select=*&id=eq.${encodeURIComponent(recordId)}&meeting_id=eq.${encodeURIComponent(meetingId)}&limit=1`
+  );
+  return rows[0] || null;
+}
+
+async function updateQrSigninMeetingSelection(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const table = getQrSigninMeetingTable(env);
+  const meetingId = firstText(payload.meetingId, payload.id);
+  if (!meetingId) return { ok: false, action: "updateQrSigninMeetingSelection", error: "MISSING_MEETING_ID" };
+
+  const before = await findQrSigninMeetingRow(env, meetingId);
+  if (!before) return { ok: false, action: "updateQrSigninMeetingSelection", error: "MEETING_NOT_FOUND", meetingId };
+
+  const requestedSelection = normalizeSwipeSelectionPayload(payload.selectionState || payload.swipeTableSelection || {});
+  const nextSelection = {
+    singleSelects: {
+      host: before.host_record_id || "",
+      recorder: before.recorder_record_id || "",
+      ...requestedSelection.singleSelects
+    },
+    multiSelects: {}
+  };
+
+  if (payload.clearSingleSelects && Array.isArray(payload.clearSingleSelects)) {
+    payload.clearSingleSelects.forEach((key) => {
+      const cleanKey = String(key || "").trim();
+      if (cleanKey === "host" || cleanKey === "recorder") nextSelection.singleSelects[cleanKey] = "";
+    });
+  }
+
+  const requestedHostRecordId = firstText(nextSelection.singleSelects.host);
+  const requestedRecorderRecordId = firstText(nextSelection.singleSelects.recorder);
+
+  if (requestedHostRecordId) {
+    const hostRecord = await findQrSigninRecordInMeeting(env, meetingId, requestedHostRecordId).catch(() => null);
+    if (!hostRecord) {
+      return { ok: false, action: "updateQrSigninMeetingSelection", error: "HOST_RECORD_NOT_IN_MEETING", meetingId, recordId: requestedHostRecordId };
+    }
+  }
+
+  if (requestedRecorderRecordId) {
+    const recorderRecord = await findQrSigninRecordInMeeting(env, meetingId, requestedRecorderRecordId).catch(() => null);
+    if (!recorderRecord) {
+      return { ok: false, action: "updateQrSigninMeetingSelection", error: "RECORDER_RECORD_NOT_IN_MEETING", meetingId, recordId: requestedRecorderRecordId };
+    }
+  }
+
+  const patch: Record<string, unknown> = {
+    updated_by: firstText(payload.updatedBy, payload.actorName, payload.actorEmployeeId) || before.updated_by || null
+  };
+  if (Object.prototype.hasOwnProperty.call(nextSelection.singleSelects, "host")) {
+    patch.host_record_id = nextSelection.singleSelects.host || null;
+  }
+  if (Object.prototype.hasOwnProperty.call(nextSelection.singleSelects, "recorder")) {
+    patch.recorder_record_id = nextSelection.singleSelects.recorder || null;
+  }
+
+  const updated = await supabasePatch<QrSigninMeetingRow[]>(env, table, `id=eq.${encodeURIComponent(meetingId)}`, patch);
+  const saved = Array.isArray(updated) && updated[0] ? updated[0] : { ...before, ...patch } as QrSigninMeetingRow;
+  const meeting = qrSigninMeetingDisplay(saved);
+
+  return {
+    ok: true,
+    action: "updateQrSigninMeetingSelection",
+    source: "skhps-backend-supabase",
+    table,
+    meetingId,
+    selectionState: nextSelection,
+    data: { ok: true, meeting, selectionState: nextSelection },
+    meeting
+  };
 }
 
 function normalizeQrSigninSubmitPayload(body: any): Record<string, unknown> {
@@ -2881,8 +2989,7 @@ async function submitQrSignin(env: Env, body: any) {
       course,
       date,
       source: "signin-payload",
-      sourceId: firstText(payload.sourceId) || undefined,
-      metadata: { rawPayload: payload, createdBy: "submitQrSignin" }
+      sourceId: firstText(payload.sourceId) || undefined
     });
     const savedRows = await saveQrSigninMeetingRows(env, [record]);
     meeting = savedRows[0] || record as QrSigninMeetingRow;
@@ -2907,7 +3014,6 @@ async function submitQrSignin(env: Env, body: any) {
       after_data: existing,
       metadata: {
         source: "submitQrSignin",
-        rawPayload: payload,
         duplicateOf: existing.id
       }
     });
@@ -2929,12 +3035,7 @@ async function submitQrSignin(env: Env, body: any) {
         signed_at: signedAt,
         status: "signed",
         reason: null,
-        client_request_id: clientRequestId || null,
-        metadata: {
-          rawPayload: payload,
-          previousStatus: existing.status,
-          previousReason: existing.reason || ""
-        }
+        client_request_id: clientRequestId || null
       };
       const updated = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(existing.id)}`, patch);
       const saved = Array.isArray(updated) && updated[0] ? updated[0] : { ...existing, ...patch } as QrSigninRecordRow;
@@ -2946,7 +3047,7 @@ async function submitQrSignin(env: Env, body: any) {
         actor_employee_id: employeeId || null,
         before_data: existing,
         after_data: saved,
-        metadata: { source: "submitQrSignin", rawPayload: payload }
+        metadata: { source: "submitQrSignin" }
       });
       const result = qrSigninResultFromRecord(saved, meeting);
       return {
@@ -2964,12 +3065,7 @@ async function submitQrSignin(env: Env, body: any) {
       signed_at: signedAt,
       status: statusInfo.status,
       reason: statusInfo.reason || null,
-      client_request_id: clientRequestId || null,
-      metadata: {
-        rawPayload: payload,
-        previousStatus: existing.status,
-        previousReason: existing.reason || ""
-      }
+      client_request_id: clientRequestId || null
     };
     const updated = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(existing.id)}`, patch);
     const saved = Array.isArray(updated) && updated[0] ? updated[0] : { ...existing, ...patch } as QrSigninRecordRow;
@@ -2983,7 +3079,6 @@ async function submitQrSignin(env: Env, body: any) {
       after_data: saved,
       metadata: {
         source: "submitQrSignin",
-        rawPayload: payload,
         attemptedStatus: statusInfo.status,
         attemptedReason: statusInfo.reason || ""
       }
@@ -3013,11 +3108,7 @@ async function submitQrSignin(env: Env, body: any) {
     reason: statusInfo.reason || null,
     source: "qr",
     duplicate_of: null,
-    client_request_id: clientRequestId || null,
-    metadata: {
-      rawPayload: payload,
-      duplicateOf: ""
-    }
+    client_request_id: clientRequestId || null
   };
 
   const inserted = await supabasePost<QrSigninRecordRow[]>(env, table, record);
@@ -3148,13 +3239,7 @@ async function updateQrSigninRecord(env: Env, body: any) {
     reason: reason || null,
     source: status === "manual" || status === "leave" ? "admin" : firstText(payload.source, before && before.source, "admin"),
     updated_by: firstText(payload.updatedBy, actorName, actorEmployeeId) || null,
-    note: firstText(payload.note, before && before.note) || null,
-    metadata: {
-      rawPayload: payload,
-      adminAction,
-      previousStatus: before ? before.status : "",
-      previousReason: before ? before.reason || "" : ""
-    }
+    note: firstText(payload.note, before && before.note) || null
   };
 
   if (status === "manual" || status === "signed") {
@@ -3191,7 +3276,7 @@ async function updateQrSigninRecord(env: Env, body: any) {
     note: firstText(payload.note) || null,
     before_data: before || {},
     after_data: saved,
-    metadata: { source: "qr-signin-backend", rawPayload: payload }
+    metadata: { source: "qr-signin-backend" }
   });
 
   const result = qrSigninResultFromRecord(saved, meeting);
@@ -3234,7 +3319,7 @@ async function deleteQrSigninRecord(env: Env, body: any) {
     note: firstText(payload.note) || null,
     before_data: before,
     after_data: {},
-    metadata: { source: "qr-signin-backend", rawPayload: payload, hardDelete: true }
+    metadata: { source: "qr-signin-backend", hardDelete: true }
   });
 
   const deleted = await supabaseDelete<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(recordId)}`);
@@ -3689,6 +3774,15 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
   if (action === "createQrSigninMeeting") {
     try {
       const result = await createQrSigninMeeting(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({ ok: false, action, source: "skhps-backend", error: error instanceof Error ? error.message : String(error) }, 500);
+    }
+  }
+
+  if (action === "updateQrSigninMeetingSelection") {
+    try {
+      const result = await updateQrSigninMeetingSelection(env, body);
       return json(result, result.ok === false ? 400 : 200);
     } catch (error) {
       return json({ ok: false, action, source: "skhps-backend", error: error instanceof Error ? error.message : String(error) }, 500);
