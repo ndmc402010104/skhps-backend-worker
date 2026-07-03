@@ -3198,6 +3198,57 @@ async function updateQrSigninRecord(env: Env, body: any) {
   return { ok: true, action: "updateQrSigninRecord", source: "skhps-backend-supabase", table, data: result, record: result, before };
 }
 
+async function deleteQrSigninRecord(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const table = getQrSigninRecordTable(env);
+  const auditTable = getQrSigninAuditTable(env);
+  const recordId = firstText(payload.recordId, payload.resultId, payload.id);
+
+  if (!recordId) return { ok: false, action: "deleteQrSigninRecord", error: "MISSING_RECORD_ID" };
+
+  const before = await findQrSigninRecordById(env, recordId);
+  if (!before) return { ok: false, action: "deleteQrSigninRecord", error: "RECORD_NOT_FOUND", recordId };
+
+  const actorName = firstText(payload.actorName, payload.updatedBy, payload.operatorName);
+  const actorEmployeeId = firstText(payload.actorEmployeeId, payload.operatorEmployeeId);
+
+  /*
+   * 真刪除：連同這筆記錄過去所有的稽核紀錄（audit trail，含最原始那一筆）一起砍掉。
+   * 跟「封存/作廢」（status=void，資料還在）是不同語意——這裡刪完之後這筆記錄的
+   * 歷史完全不存在，之後如果要做「恢復原始資料」，是靠 audit trail 保留原始 before_data，
+   * 所以這個 delete 動作本身也要留一筆自己的稽核紀錄（存在另一張表／或直接記 log），
+   * 避免砍掉之後完全查不到「誰在什麼時候刪除了這筆」。
+   */
+  await supabaseDelete<unknown[]>(env, auditTable, `record_id=eq.${encodeURIComponent(recordId)}`).catch(() => []);
+
+  // record_id 是 FK（on delete set null），一定要在刪記錄「之前」寫入，
+  // 不然記錄一旦被刪掉，這筆稽核紀錄的 record_id 會直接違反外鍵限制而寫入失敗。
+  // 記錄真的被刪除後，Postgres 會自動把這筆的 record_id 設成 null，
+  // before_data 裡仍保留完整快照，所以不影響追溯「誰在何時刪除了什麼」。
+  await insertQrSigninAudit(env, {
+    record_id: recordId,
+    meeting_id: before.meeting_id,
+    action: "delete-record",
+    actor_name: actorName || null,
+    actor_employee_id: actorEmployeeId || null,
+    note: firstText(payload.note) || null,
+    before_data: before,
+    after_data: {},
+    metadata: { source: "qr-signin-backend", rawPayload: payload, hardDelete: true }
+  });
+
+  const deleted = await supabaseDelete<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(recordId)}`);
+
+  return {
+    ok: true,
+    action: "deleteQrSigninRecord",
+    source: "skhps-backend-supabase",
+    table,
+    recordId,
+    deletedCount: Array.isArray(deleted) ? deleted.length : 0
+  };
+}
+
 function csvCell(value: unknown): string {
   const text = String(value === undefined || value === null ? "" : value);
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
@@ -3689,6 +3740,20 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
   if (action === "updateQrSigninRecord") {
     try {
       const result = await updateQrSigninRecord(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "deleteQrSigninRecord") {
+    try {
+      const result = await deleteQrSigninRecord(env, body);
       return json(result, result.ok === false ? 400 : 200);
     } catch (error) {
       return json({
