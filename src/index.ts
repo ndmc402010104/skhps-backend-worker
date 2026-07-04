@@ -3386,7 +3386,12 @@ async function submitQrSignin(env: Env, body: any) {
     };
   }
 
+  // 全新的人第一次簽到：這一筆本身就是 QR 原始基準也是新的一條版本鏈，chain_id 是
+  // NOT NULL 欄位，必須在 INSERT 當下就給值——不能像舊寫法那樣先插入再事後 PATCH
+  // 補 chain_id，那樣 INSERT 本身就會先被 NOT NULL 擋掉。
+  const newRecordId = crypto.randomUUID();
   const record: Record<string, unknown> = {
+    id: newRecordId,
     meeting_id: meetingId,
     app_id: "qr-signin",
     env: appEnv,
@@ -3400,16 +3405,13 @@ async function submitQrSignin(env: Env, body: any) {
     reason: statusInfo.reason || null,
     source: "qr",
     duplicate_of: null,
-    client_request_id: clientRequestId || null
+    client_request_id: clientRequestId || null,
+    qr_origin_id: newRecordId,
+    chain_id: newRecordId
   };
 
   const inserted = await supabasePost<QrSigninRecordRow[]>(env, table, record);
   let saved = Array.isArray(inserted) && inserted[0] ? inserted[0] : record as QrSigninRecordRow;
-  // 全新的人第一次簽到：這一筆本身就是 QR 原始基準也是新的一條版本鏈，兩個自我指向欄位都指向自己。
-  if (saved.id) {
-    const selfOrigin = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(saved.id)}`, { qr_origin_id: saved.id, chain_id: saved.id });
-    saved = Array.isArray(selfOrigin) && selfOrigin[0] ? selfOrigin[0] : { ...saved, qr_origin_id: saved.id, chain_id: saved.id };
-  }
   await insertQrSigninAudit(env, {
     record_id: saved.id || null,
     meeting_id: meetingId,
@@ -3730,7 +3732,11 @@ async function updateQrSigninRecord(env: Env, body: any) {
     saved = versioned.saved;
   } else {
     // 全新的人（後台手動新增，沒有既有記錄可版本化）：一律沒有 QR 基準。
+    // chain_id 是 NOT NULL，必須在 INSERT 當下就給值（同 submitQrSignin 的新人分支），
+    // 不能先插入再事後 PATCH 補 chain_id，那樣 INSERT 本身就會被 NOT NULL 擋掉。
+    const newRecordId = crypto.randomUUID();
     const record: Record<string, unknown> = {
+      id: newRecordId,
       meeting_id: meetingId,
       app_id: "qr-signin",
       env: appEnv,
@@ -3740,16 +3746,11 @@ async function updateQrSigninRecord(env: Env, body: any) {
       client_request_id: firstText(payload.clientRequestId) || null,
       created_by: firstText(payload.createdBy, actorName, actorEmployeeId) || null,
       qr_origin_id: null,
+      chain_id: newRecordId,
       ...patch
     };
     const inserted = await supabasePost<QrSigninRecordRow[]>(env, table, record);
     saved = Array.isArray(inserted) && inserted[0] ? inserted[0] : record as QrSigninRecordRow;
-
-    // 全新一條版本鏈：chain_id 指向自己（DB 產生 id 之後才知道，需要事後補一次 PATCH）。
-    if (saved.id) {
-      const selfChain = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(saved.id)}`, { chain_id: saved.id });
-      saved = Array.isArray(selfChain) && selfChain[0] ? selfChain[0] : { ...saved, chain_id: saved.id };
-    }
 
     await insertQrSigninAudit(env, {
       record_id: saved.id || null,
