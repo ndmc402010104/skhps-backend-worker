@@ -2219,6 +2219,10 @@ type QrSigninRecordRow = {
   updated_by: string | null;
   note: string | null;
   metadata: Record<string, unknown> | null;
+  version_no: string;
+  supersedes_id: string | null;
+  qr_origin_id: string | null;
+  chain_id: string;
   created_at: string;
   updated_at: string;
 };
@@ -2597,26 +2601,21 @@ async function listQrSigninMeetingRows(env: Env, appEnv: AppEnvName, limit = 200
     `${encodeURIComponent(table)}?select=*&env=eq.${encodeURIComponent(appEnv)}&enabled=eq.true&status=eq.active&order=starts_at.desc.nullslast&limit=${limit}`
   );
   
-  // 過濾出未來15天內的會議
-  const now = Date.now();
-  const futureWindow = 15 * 24 * 60 * 60 * 1000; // 15 days in milliseconds
-  const futureLimit = now + futureWindow;
-  
+  // 返回所有符合 enabled 和 status 條件的會議，不過濾時間
   return rows.filter((row) => {
     if (!row.starts_at) return true; // 沒有開始時間的會議保留
     const startsAt = Date.parse(row.starts_at);
-    if (!Number.isFinite(startsAt)) return true;
-    // 顯示未來15天內的會議
-    return startsAt <= futureLimit;
+    return Number.isFinite(startsAt); // 只保留有效的時間戳
   });
 }
 
-async function countQrSigninRecordsByMeeting(env: Env, meetingId: string): Promise<number> {
+async function countQrSigninRecordsByMeeting(env: Env, meetingId: string, appEnv?: AppEnvName): Promise<number> {
   const table = getQrSigninRecordTable(env);
-  const rows = await supabaseGet<Array<{ count: string }>>(
-    env,
-    `${encodeURIComponent(table)}?select=count&meeting_id=eq.${encodeURIComponent(meetingId)}&status=not.in.(void,duplicate,error)`
-  );
+  let path = `${encodeURIComponent(table)}?select=count&meeting_id=eq.${encodeURIComponent(meetingId)}&status=not.in.(void,duplicate,error)`;
+  if (appEnv) {
+    path += `&env=eq.${encodeURIComponent(appEnv)}`;
+  }
+  const rows = await supabaseGet<Array<{ count: string }>>(env, path);
   
   const countHeader = rows.length > 0 ? rows[0].count : "0";
   return parseInt(String(countHeader || "0"), 10);
@@ -2740,7 +2739,7 @@ async function getQrSigninMeetings(env: Env, body: any) {
   // 並行查詢每個會議的簽到記錄數
   const meetingsWithCounts = await Promise.all(rows.map(async (row) => {
     const display = qrSigninMeetingDisplay(row);
-    const signinCount = await countQrSigninRecordsByMeeting(env, row.id).catch(() => 0);
+    const signinCount = await countQrSigninRecordsByMeeting(env, row.id, appEnv).catch(() => 0);
     return {
       ...display,
       signinRecordCount: signinCount
@@ -2833,12 +2832,12 @@ function normalizeSwipeSelectionPayload(input: unknown): {
   return { singleSelects };
 }
 
-async function findQrSigninRecordInMeeting(env: Env, meetingId: string, recordId: string): Promise<QrSigninRecordRow | null> {
+async function findQrSigninRecordInMeeting(env: Env, meetingId: string, recordId: string, appEnv: AppEnvName): Promise<QrSigninRecordRow | null> {
   if (!meetingId || !recordId) return null;
   const table = getQrSigninRecordTable(env);
   const rows = await supabaseGet<QrSigninRecordRow[]>(
     env,
-    `${encodeURIComponent(table)}?select=*&id=eq.${encodeURIComponent(recordId)}&meeting_id=eq.${encodeURIComponent(meetingId)}&limit=1`
+    `${encodeURIComponent(table)}?select=*&id=eq.${encodeURIComponent(recordId)}&meeting_id=eq.${encodeURIComponent(meetingId)}&env=eq.${encodeURIComponent(appEnv)}&limit=1`
   );
   return rows[0] || null;
 }
@@ -2847,6 +2846,7 @@ async function updateQrSigninMeetingSelection(env: Env, body: any) {
   const payload = normalizeRegistryPayload(body);
   const table = getQrSigninMeetingTable(env);
   const meetingId = firstText(payload.meetingId, payload.id);
+  const appEnv = normalizeEnv(firstText(payload.env, payload.appEnv));
   if (!meetingId) return { ok: false, action: "updateQrSigninMeetingSelection", error: "MISSING_MEETING_ID" };
 
   const before = await findQrSigninMeetingRow(env, meetingId);
@@ -2874,28 +2874,55 @@ async function updateQrSigninMeetingSelection(env: Env, body: any) {
   const touchesHost = clearedKeys.has("host") || Boolean(requestedHostRecordId);
   const touchesRecorder = clearedKeys.has("recorder") || Boolean(requestedRecorderRecordId);
 
+  let hostRecord: QrSigninRecordRow | null = null;
+  let recorderRecord: QrSigninRecordRow | null = null;
+
   if (requestedHostRecordId) {
-    const hostRecord = await findQrSigninRecordInMeeting(env, meetingId, requestedHostRecordId).catch(() => null);
+    hostRecord = await findQrSigninRecordInMeeting(env, meetingId, requestedHostRecordId, appEnv).catch(() => null);
     if (!hostRecord) {
       return { ok: false, action: "updateQrSigninMeetingSelection", error: "HOST_RECORD_NOT_IN_MEETING", meetingId, recordId: requestedHostRecordId };
     }
   }
 
   if (requestedRecorderRecordId) {
-    const recorderRecord = await findQrSigninRecordInMeeting(env, meetingId, requestedRecorderRecordId).catch(() => null);
+    recorderRecord = requestedRecorderRecordId === requestedHostRecordId
+      ? hostRecord
+      : await findQrSigninRecordInMeeting(env, meetingId, requestedRecorderRecordId, appEnv).catch(() => null);
     if (!recorderRecord) {
       return { ok: false, action: "updateQrSigninMeetingSelection", error: "RECORDER_RECORD_NOT_IN_MEETING", meetingId, recordId: requestedRecorderRecordId };
     }
+  }
+
+  /*
+   * 設主持人/紀錄者也算一次編輯，所以先幫被選中的那筆 INSERT 新版本（source 改為
+   * "admin"），meeting 要寫入的 host_record_id/recorder_record_id 用「新版本的 id」，
+   * 不是 request 裡的舊 id——這樣 QrSigninRecordCurrent（version_no 最大值）查到的
+   * 才會是新版本，新版本才是真正代表這個人的那一筆。主持人跟紀錄者剛好是同一筆時
+   * 只版本化一次，兩個欄位共用同一個新 id。
+   */
+  const actorName = firstText(payload.updatedBy, payload.actorName);
+  const actorEmployeeId = firstText(payload.actorEmployeeId);
+  let newHostId = "";
+  let newRecorderId = "";
+
+  if (hostRecord) {
+    const versioned = await createQrSigninRecordVersion(env, hostRecord, { source: "admin" }, "set-host", { actorName, actorEmployeeId });
+    newHostId = versioned.saved.id;
+    if (recorderRecord && recorderRecord.id === hostRecord.id) newRecorderId = newHostId;
+  }
+  if (recorderRecord && !newRecorderId) {
+    const versioned = await createQrSigninRecordVersion(env, recorderRecord, { source: "admin" }, "set-recorder", { actorName, actorEmployeeId });
+    newRecorderId = versioned.saved.id;
   }
 
   const patch: Record<string, unknown> = {
     updated_by: firstText(payload.updatedBy, payload.actorName, payload.actorEmployeeId) || before.updated_by || null
   };
   if (touchesHost) {
-    patch.host_record_id = requestedHostRecordId || null;
+    patch.host_record_id = newHostId || null;
   }
   if (touchesRecorder) {
-    patch.recorder_record_id = requestedRecorderRecordId || null;
+    patch.recorder_record_id = newRecorderId || null;
   }
 
   const updated = await supabasePatch<QrSigninMeetingRow[]>(env, table, `id=eq.${encodeURIComponent(meetingId)}`, patch);
@@ -3060,21 +3087,14 @@ function qrSigninOriginalSource(row: QrSigninRecordRow, original?: Record<string
   return firstText(row && row.source, "admin");
 }
 
-async function findQrSigninRecordOriginalSnapshot(env: Env, recordId: string): Promise<Record<string, unknown> | null> {
-  const table = getQrSigninAuditTable(env);
-  const rows = await supabaseGet<QrSigninAuditRow[]>(
-    env,
-    `${encodeURIComponent(table)}?select=*&record_id=eq.${encodeURIComponent(recordId)}&order=created_at.asc&limit=100`
-  ).catch(() => [] as QrSigninAuditRow[]);
-
-  for (const audit of rows) {
-    const after = audit && audit.after_data && typeof audit.after_data === "object" ? audit.after_data : null;
-    if (!after) continue;
-    const afterId = firstText(after.id, after.resultId);
-    if (!afterId || afterId === recordId) return after;
-  }
-
-  return null;
+/*
+ * 「QR 原始基準」= qr_origin_id 指向的那筆，不是這筆自己的 audit 快照——
+ * 單純 PK 查，沒有 qr_origin_id（從沒有真正 QR 簽到過）就回 null。
+ */
+async function findQrSigninRecordQrOrigin(env: Env, row: QrSigninRecordRow | null | undefined): Promise<QrSigninRecordRow | null> {
+  if (!row || !row.qr_origin_id) return null;
+  if (row.qr_origin_id === row.id) return row;
+  return findQrSigninRecordById(env, row.qr_origin_id);
 }
 
 function qrSigninResultFromRecord(row: QrSigninRecordRow, meeting?: QrSigninMeetingRow | null, original?: Record<string, unknown> | null): Record<string, unknown> {
@@ -3090,6 +3110,14 @@ function qrSigninResultFromRecord(row: QrSigninRecordRow, meeting?: QrSigninMeet
   return {
     resultId: row.id,
     meetingId: row.meeting_id,
+    /*
+     * chainId：這條版本鏈從第一筆就決定、之後每次編輯都原封不動繼承的身分識別，
+     * 跟 name/employeeId 這些「內容」完全脫鉤——內容可以被編輯（甚至改錯字），
+     * 但 chainId 不會變。前端合併本地狀態（upsertLocalRecord）要用這個判斷
+     * 「這是同一個人」，不能只靠 employeeId/name（那兩個本身就是可編輯的內容，
+     * 編輯當下改掉的話會比對不到本地舊記錄，變成畫面上重複出現同一個人）。
+     */
+    chainId: row.chain_id,
     status,
     reason,
     meeting: firstText(display.title, display.course, "會議簽到"),
@@ -3112,6 +3140,21 @@ function qrSigninResultFromRecord(row: QrSigninRecordRow, meeting?: QrSigninMeet
     isRecorder: roleFlags.isRecorder,
     hasBackendRoleState: roleFlags.isHost || roleFlags.isRecorder,
     isEdited,
+    hasQrOrigin: Boolean(original),
+    /*
+     * 「兩包資料」的 package A：這個人這場會議最早一筆真正 QR 自行簽到的內容。
+     * null 代表從沒有真正 QR 簽到過——前端「清除修改內容」的顯示條件必須以此為準，
+     * 不能只看 source/isEdited（否則「後台先建、從沒有 QR 到來」的記錄也會顯示清除）。
+     */
+    qrOriginRecord: original
+      ? {
+          name: firstText(original.name),
+          role: firstText(original.role),
+          employeeId: firstText(original.employee_id, original.employeeId),
+          signedAt: firstText(original.signed_at, original.recordedSignedAt, original.signedAt),
+          status: firstText(original.status)
+        }
+      : null,
     message: status === "success" ? "簽到成功" : status === "duplicate" ? "你已經簽到過，不需要重複送出" : "簽到失敗"
   };
 }
@@ -3122,9 +3165,14 @@ async function findQrSigninMeetingRow(env: Env, meetingId: string): Promise<QrSi
   return rows[0] || null;
 }
 
+/*
+ * QrSigninRecordCurrent 是一個 view（distinct on meeting_id/employee_id/lower(name)
+ * 取 version_no 最大值），取代原本的 is_current=eq.true 篩選——一人一場一筆是查詢
+ * 時保證的，不再需要 DB 唯一索引強制，也就不會有「兩個請求搶著標 is_current」的
+ * race condition。
+ */
 async function findCurrentQrSigninRecord(env: Env, input: { meetingId: string; employeeId: string; name: string }): Promise<QrSigninRecordRow | null> {
-  const table = getQrSigninRecordTable(env);
-  let path = `${encodeURIComponent(table)}?select=*&meeting_id=eq.${encodeURIComponent(input.meetingId)}&status=not.in.(duplicate,void,error)&order=submitted_at.asc&limit=1`;
+  let path = `${encodeURIComponent("QrSigninRecordCurrent")}?select=*&meeting_id=eq.${encodeURIComponent(input.meetingId)}&limit=1`;
   if (input.employeeId) {
     path += `&employee_id=eq.${encodeURIComponent(input.employeeId)}`;
   } else {
@@ -3238,6 +3286,17 @@ async function submitQrSignin(env: Env, body: any) {
   }
 
   if (existing) {
+    /*
+     * 這個人這場會議已經有一筆現存記錄。兩種情況：
+     * - existing.source === 'qr'：這是同一個人自己先前的 QR 嘗試（例如逾時後重掃），
+     *   維持現狀 UPDATE-in-place——這是同一個 QR 事件本身在完成，不是別人的編輯。
+     * - existing.source !== 'qr'：後台先建立/補登過這個人（例如手動預先登記），
+     *   現在才出現真正的 QR 自行簽到。這一刻起 QR 才是「主原始資料」，後台先前
+     *   補的內容變成被取代的附加/補充版本，必須 INSERT 新版本（不是直接覆蓋），
+     *   且這一筆新版本的 qr_origin_id 要指向自己（這條鏈第一次出現真正 QR）。
+     */
+    const isOwnQrRetry = existing.source === "qr";
+
     if (statusInfo.status === "signed") {
       const patch: Record<string, unknown> = {
         role,
@@ -3247,18 +3306,28 @@ async function submitQrSignin(env: Env, body: any) {
         source: "qr",
         client_request_id: clientRequestId || null
       };
-      const updated = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(existing.id)}`, patch);
-      const saved = Array.isArray(updated) && updated[0] ? updated[0] : { ...existing, ...patch } as QrSigninRecordRow;
-      await insertQrSigninAudit(env, {
-        record_id: saved.id || null,
-        meeting_id: meetingId,
-        action: "resolve-failed-signin",
-        actor_name: name,
-        actor_employee_id: employeeId || null,
-        before_data: existing,
-        after_data: saved,
-        metadata: { source: "submitQrSignin" }
-      });
+      let saved: QrSigninRecordRow;
+      if (isOwnQrRetry) {
+        const updated = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(existing.id)}`, patch);
+        saved = Array.isArray(updated) && updated[0] ? updated[0] : { ...existing, ...patch } as QrSigninRecordRow;
+        await insertQrSigninAudit(env, {
+          record_id: saved.id || null,
+          meeting_id: meetingId,
+          action: "resolve-failed-signin",
+          actor_name: name,
+          actor_employee_id: employeeId || null,
+          before_data: existing,
+          after_data: saved,
+          metadata: { source: "submitQrSignin" }
+        });
+      } else {
+        const versioned = await createQrSigninRecordVersion(env, existing, patch, "qr-signin-supersedes-admin", {
+          actorName: name,
+          actorEmployeeId: employeeId || null,
+          selfIsQrOrigin: true
+        });
+        saved = versioned.saved;
+      }
       const result = qrSigninResultFromRecord(saved, meeting);
       return {
         ok: true,
@@ -3278,22 +3347,33 @@ async function submitQrSignin(env: Env, body: any) {
       source: "qr",
       client_request_id: clientRequestId || null
     };
-    const updated = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(existing.id)}`, patch);
-    const saved = Array.isArray(updated) && updated[0] ? updated[0] : { ...existing, ...patch } as QrSigninRecordRow;
-    await insertQrSigninAudit(env, {
-      record_id: saved.id || null,
-      meeting_id: meetingId,
-      action: "repeated-failed-signin",
-      actor_name: name,
-      actor_employee_id: employeeId || null,
-      before_data: existing,
-      after_data: saved,
-      metadata: {
-        source: "submitQrSignin",
-        attemptedStatus: statusInfo.status,
-        attemptedReason: statusInfo.reason || ""
-      }
-    });
+    let saved: QrSigninRecordRow;
+    if (isOwnQrRetry) {
+      const updated = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(existing.id)}`, patch);
+      saved = Array.isArray(updated) && updated[0] ? updated[0] : { ...existing, ...patch } as QrSigninRecordRow;
+      await insertQrSigninAudit(env, {
+        record_id: saved.id || null,
+        meeting_id: meetingId,
+        action: "repeated-failed-signin",
+        actor_name: name,
+        actor_employee_id: employeeId || null,
+        before_data: existing,
+        after_data: saved,
+        metadata: {
+          source: "submitQrSignin",
+          attemptedStatus: statusInfo.status,
+          attemptedReason: statusInfo.reason || ""
+        }
+      });
+    } else {
+      const versioned = await createQrSigninRecordVersion(env, existing, patch, "qr-signin-supersedes-admin", {
+        actorName: name,
+        actorEmployeeId: employeeId || null,
+        selfIsQrOrigin: true,
+        metadata: { attemptedStatus: statusInfo.status, attemptedReason: statusInfo.reason || "" }
+      });
+      saved = versioned.saved;
+    }
     const failedResult = qrSigninResultFromRecord(saved, meeting);
     return {
       ok: true,
@@ -3323,7 +3403,12 @@ async function submitQrSignin(env: Env, body: any) {
   };
 
   const inserted = await supabasePost<QrSigninRecordRow[]>(env, table, record);
-  const saved = Array.isArray(inserted) && inserted[0] ? inserted[0] : record as QrSigninRecordRow;
+  let saved = Array.isArray(inserted) && inserted[0] ? inserted[0] : record as QrSigninRecordRow;
+  // 全新的人第一次簽到：這一筆本身就是 QR 原始基準也是新的一條版本鏈，兩個自我指向欄位都指向自己。
+  if (saved.id) {
+    const selfOrigin = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(saved.id)}`, { qr_origin_id: saved.id, chain_id: saved.id });
+    saved = Array.isArray(selfOrigin) && selfOrigin[0] ? selfOrigin[0] : { ...saved, qr_origin_id: saved.id, chain_id: saved.id };
+  }
   await insertQrSigninAudit(env, {
     record_id: saved.id || null,
     meeting_id: meetingId,
@@ -3355,17 +3440,22 @@ async function getQrSigninResult(env: Env, body: any) {
   if (!rows.length) return { ok: false, action: "getQrSigninResult", error: "RESULT_NOT_FOUND", resultId };
 
   const meeting = await findQrSigninMeetingRow(env, rows[0].meeting_id).catch(() => null);
-  const original = await findQrSigninRecordOriginalSnapshot(env, rows[0].id).catch(() => null);
+  const original = await findQrSigninRecordQrOrigin(env, rows[0]).catch(() => null);
   const result = qrSigninResultFromRecord(rows[0], meeting, original);
   return { ok: true, action: "getQrSigninResult", source: "skhps-backend-supabase", table, data: result, ...result };
 }
 
 async function listQrSigninRecords(env: Env, body: any) {
   const payload = normalizeRegistryPayload(body);
+  const appEnv = normalizeEnv(firstText(body.env, payload.env));
   const limit = Math.min(Math.max(qrNumberFromEnv(payload.limit, 100), 1), 500);
   const meetingId = firstText(payload.meetingId);
   const table = getQrSigninRecordTable(env);
-  let path = `${encodeURIComponent(table)}?select=*&order=signed_at.asc.nullslast,submitted_at.asc.nullslast,created_at.asc&limit=${limit}`;
+  // QrSigninRecordCurrent 一人一場一筆（version_no 最大值），不再需要「同人分組、
+  // 保留最舊 QR + 最新 admin」的 client-side 拼裝——那套邏輯是舊「直接 UPDATE 覆蓋」
+  // 設計遺留的權宜之計。
+  let path = `${encodeURIComponent("QrSigninRecordCurrent")}?select=*&env=eq.${encodeURIComponent(appEnv)}&order=submitted_at.asc.nullslast,created_at.asc&limit=${limit}`;
+  // 如果有指定 meetingId，就篩選該會議，否則查全部
   if (meetingId) path += `&meeting_id=eq.${encodeURIComponent(meetingId)}`;
   const rows = await supabaseGet<QrSigninRecordRow[]>(env, path);
 
@@ -3378,7 +3468,7 @@ async function listQrSigninRecords(env: Env, body: any) {
 
   const records: Record<string, unknown>[] = [];
   for (const row of rows) {
-    const original = await findQrSigninRecordOriginalSnapshot(env, row.id).catch(() => null);
+    const original = await findQrSigninRecordQrOrigin(env, row).catch(() => null);
     records.push(qrSigninResultFromRecord(row, meetings.get(row.meeting_id) || null, original));
   }
   return { ok: true, action: "listQrSigninRecords", source: "skhps-backend-supabase", table, count: records.length, records, data: records };
@@ -3409,6 +3499,87 @@ async function findQrSigninRecordById(env: Env, recordId: string): Promise<QrSig
   const table = getQrSigninRecordTable(env);
   const rows = await supabaseGet<QrSigninRecordRow[]>(env, `${encodeURIComponent(table)}?select=*&id=eq.${encodeURIComponent(recordId)}&limit=1`);
   return rows[0] || null;
+}
+
+/*
+ * 每一次「編輯」都在這裡 INSERT 一筆新版本，不直接 UPDATE 原本那筆：
+ * - 舊版內容原封不動保留（版本歷史用實體 row 呈現，不必只靠 QrSigninRecordAudit
+ *   的 before/after_data 才能還原）。
+ * - 純粹一筆 INSERT，不需要先 UPDATE 任何東西：「目前生效版本」是查詢時的概念
+ *   （QrSigninRecordCurrent view 取 version_no 最大值），天生不會有併發衝突——
+ *   這裡曾經用 is_current 旗標 + 唯一索引實作，逼得每次都要「先標舊版 false、
+ *   再 INSERT 新版 true」兩步，兩個請求前後腳搶著寫就會撞唯一索引丟 500；
+ *   改成單純比 version_no 之後這個 race 整類消失。
+ * - qr_origin_id 預設整條繼承前一版的值，不會因為後續編輯而改變——這是「清除修改
+ *   內容」要回到的 QR 原始基準，只有 submitQrSignin 偵測到「這條鏈第一次出現真正
+ *   QR 簽到」時才會改寫它（見 submitQrSignin）。
+ * - 若前一版剛好是這場會議的主持人/紀錄者，host_record_id/recorder_record_id 會
+ *   自動跟著新版本走（只 patch 有命中的那個欄位，維持既有的防併發寫法）。
+ */
+async function createQrSigninRecordVersion(
+  env: Env,
+  previous: QrSigninRecordRow,
+  patch: Record<string, unknown>,
+  auditAction: string,
+  auditMeta: {
+    actorName?: string | null;
+    actorEmployeeId?: string | null;
+    note?: string | null;
+    metadata?: Record<string, unknown>;
+    /*
+     * 只有 submitQrSignin 偵測到「這條鏈第一次出現真正 QR 簽到」時才會傳 true——
+     * 這一筆新版本本身就是 QR 原始基準，qr_origin_id 要指向自己，不是繼承前一版
+     * （前一版通常是後台先建的 admin 記錄，沒有 QR 基準可繼承）。
+     */
+    selfIsQrOrigin?: boolean;
+  }
+): Promise<{ saved: QrSigninRecordRow; meeting: QrSigninMeetingRow | null }> {
+  const table = getQrSigninRecordTable(env);
+
+  const newRow: Record<string, unknown> = {
+    ...previous,
+    ...patch,
+    supersedes_id: previous.id,
+    qr_origin_id: auditMeta.selfIsQrOrigin ? null : (previous.qr_origin_id || null)
+  };
+  delete newRow.id;
+  delete newRow.version_no;
+  delete newRow.created_at;
+  delete newRow.updated_at;
+
+  const inserted = await supabasePost<QrSigninRecordRow[]>(env, table, newRow);
+  let saved = Array.isArray(inserted) && inserted[0] ? inserted[0] : newRow as QrSigninRecordRow;
+
+  if (auditMeta.selfIsQrOrigin && saved.id) {
+    const selfOrigin = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(saved.id)}`, { qr_origin_id: saved.id });
+    saved = Array.isArray(selfOrigin) && selfOrigin[0] ? selfOrigin[0] : { ...saved, qr_origin_id: saved.id };
+  }
+
+  let meeting: QrSigninMeetingRow | null = await findQrSigninMeetingRow(env, previous.meeting_id).catch(() => null);
+  if (meeting) {
+    const meetingPatch: Record<string, unknown> = {};
+    if (meeting.host_record_id === previous.id) meetingPatch.host_record_id = saved.id;
+    if (meeting.recorder_record_id === previous.id) meetingPatch.recorder_record_id = saved.id;
+    if (Object.keys(meetingPatch).length) {
+      const meetingTable = getQrSigninMeetingTable(env);
+      const updatedMeetings = await supabasePatch<QrSigninMeetingRow[]>(env, meetingTable, `id=eq.${encodeURIComponent(meeting.id)}`, meetingPatch);
+      meeting = Array.isArray(updatedMeetings) && updatedMeetings[0] ? updatedMeetings[0] : { ...meeting, ...meetingPatch } as QrSigninMeetingRow;
+    }
+  }
+
+  await insertQrSigninAudit(env, {
+    record_id: saved.id || null,
+    meeting_id: previous.meeting_id,
+    action: auditAction,
+    actor_name: auditMeta.actorName || null,
+    actor_employee_id: auditMeta.actorEmployeeId || null,
+    note: auditMeta.note || null,
+    before_data: previous,
+    after_data: saved,
+    metadata: { source: "qr-signin-backend", ...(auditMeta.metadata || {}) }
+  });
+
+  return { saved, meeting };
 }
 
 async function updateQrSigninRecord(env: Env, body: any) {
@@ -3443,16 +3614,69 @@ async function updateQrSigninRecord(env: Env, body: any) {
   if (!status) return { ok: false, action: "updateQrSigninRecord", error: "MISSING_STATUS" };
   if (!before && !name) return { ok: false, action: "updateQrSigninRecord", error: "MISSING_NAME" };
 
+  /*
+   * 「新增人員」＝前端送過來時沒有 recordId（見 qr-signin-backend.js 的
+   * qrSwipePayload，新增的 transient row 從沒被存過，recordId 一定是空字串）。
+   * 這種情況下如果姓名+員編剛好跟這場會議「目前生效」的某個人一樣，不能悄悄把
+   * 對方的鏈也版本化一次——那等於在使用者沒發現的情況下改掉了別人的簽到資料
+   * （例如員編多打一碼、剛好撞到別人）。改成直接擋下來，回傳那個人現有的資料，
+   * 讓前端問使用者「這個人已經在名單裡，要不要改成編輯」。
+   */
+  const isNewPersonAttempt = !recordId;
+
   if (!before) {
     before = await findCurrentQrSigninRecord(env, { meetingId, employeeId, name }).catch(() => null);
   }
 
-  // 根據新邏輯判斷 source：比對新內容是否與原始 QR 記錄相同
+  if (isNewPersonAttempt && before) {
+    const existingOriginal = before.qr_origin_id ? await findQrSigninRecordById(env, before.qr_origin_id).catch(() => null) : null;
+    const existingResult = qrSigninResultFromRecord(before, meeting, existingOriginal);
+    return {
+      ok: false,
+      action: "updateQrSigninRecord",
+      error: "DUPLICATE_PERSON_IN_MEETING",
+      existingRecordId: before.id,
+      existingRecord: existingResult,
+      record: existingResult
+    };
+  }
+
+  /*
+   * 編輯表單裡的主持人/紀錄者切換（bottom sheet 內建的 data-sk-bottom-sheet-single-select）
+   * 跟表單「儲存」是同一次使用者動作，但水庫會各自獨立觸發一次 onSingleSelectSave 和
+   * 一次 onSave——如果前端各自打一次後端請求，會各自對這筆記錄版本化成兩條不同的鏈
+   * （其中一條通常會因為「內容沒變」被判定 source 打回 qr，而且沒人接手把 meeting
+   * 的主持人指標接到那條鏈上），使用者會看到「儲存後主持人打勾又消失、來源跳回前台」。
+   * 前端現在會把編輯時的主持人/紀錄者切換合併進同一次 updateQrSigninRecord 請求
+   * （見 qr-signin-backend.js 的 onSingleSelectSave + handleQrSwipeSave），這裡收到
+   * selectionState/clearSingleSelects 就一起套用在「這一次」建立的版本上，全程只有
+   * 一條版本鏈、一次寫入。
+   */
+  const selectionPayload = normalizeSwipeSelectionPayload(payload.selectionState || {});
+  const clearedSelectionKeys = new Set<string>();
+  if (Array.isArray(payload.clearSingleSelects)) {
+    payload.clearSingleSelects.forEach((key: unknown) => {
+      const cleanKey = String(key || "").trim();
+      if (cleanKey === "host" || cleanKey === "recorder") clearedSelectionKeys.add(cleanKey);
+    });
+  }
+  const requestedHostRecordId = clearedSelectionKeys.has("host") ? "" : firstText(selectionPayload.singleSelects.host);
+  const requestedRecorderRecordId = clearedSelectionKeys.has("recorder") ? "" : firstText(selectionPayload.singleSelects.recorder);
+  const touchesHost = clearedSelectionKeys.has("host") || Boolean(requestedHostRecordId);
+  const touchesRecorder = clearedSelectionKeys.has("recorder") || Boolean(requestedRecorderRecordId);
+  const becomesHost = touchesHost && before && requestedHostRecordId === before.id;
+  const becomesRecorder = touchesRecorder && before && requestedRecorderRecordId === before.id;
+
+  // 根據新邏輯判斷 source：比對新內容是否與 QR 原始基準（qr_origin_id 指向的那筆）相同
   let computedSource = before ? before.source : "admin";  // 預設用現在的 source
-  
-  if (status !== "manual" && status !== "leave" && before) {
-    // 取得原始快照來比對
-    const original = await findQrSigninRecordOriginalSnapshot(env, before.id).catch(() => null);
+
+  if (becomesHost || becomesRecorder) {
+    // 這次編輯同時把這筆設成主持人/紀錄者：跟 updateQrSigninMeetingSelection 的行為
+    // 一致，一律標記 source=admin，不要被下面「內容沒變就打回 qr」的邏輯蓋掉。
+    computedSource = "admin";
+  } else if (status !== "manual" && status !== "leave" && before) {
+    // 取得 QR 原始基準來比對（不是這筆自己的 audit 快照，而是整條鏈的 qr_origin_id）
+    const original = before.qr_origin_id ? await findQrSigninRecordById(env, before.qr_origin_id).catch(() => null) : null;
     if (original) {
       // 構建新的內容物件（用於比對）
       const newContent = {
@@ -3471,7 +3695,7 @@ async function updateQrSigninRecord(env: Env, body: any) {
       );
       
       if (isUnchanged) {
-        computedSource = original.source || "admin";
+        computedSource = String(original.source || "admin");
       } else {
         // 內容改變過，標記為後台修改
         computedSource = "admin";
@@ -3497,9 +3721,14 @@ async function updateQrSigninRecord(env: Env, body: any) {
 
   let saved: QrSigninRecordRow;
   if (before) {
-    const updated = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(before.id)}`, patch);
-    saved = Array.isArray(updated) && updated[0] ? updated[0] : { ...before, ...patch } as QrSigninRecordRow;
+    const versioned = await createQrSigninRecordVersion(env, before, patch, adminAction, {
+      actorName,
+      actorEmployeeId,
+      note: firstText(payload.note)
+    });
+    saved = versioned.saved;
   } else {
+    // 全新的人（後台手動新增，沒有既有記錄可版本化）：一律沒有 QR 基準。
     const record: Record<string, unknown> = {
       meeting_id: meetingId,
       app_id: "qr-signin",
@@ -3509,29 +3738,53 @@ async function updateQrSigninRecord(env: Env, body: any) {
       duplicate_of: null,
       client_request_id: firstText(payload.clientRequestId) || null,
       created_by: firstText(payload.createdBy, actorName, actorEmployeeId) || null,
+      qr_origin_id: null,
       ...patch
     };
     const inserted = await supabasePost<QrSigninRecordRow[]>(env, table, record);
     saved = Array.isArray(inserted) && inserted[0] ? inserted[0] : record as QrSigninRecordRow;
+
+    // 全新一條版本鏈：chain_id 指向自己（DB 產生 id 之後才知道，需要事後補一次 PATCH）。
+    if (saved.id) {
+      const selfChain = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(saved.id)}`, { chain_id: saved.id });
+      saved = Array.isArray(selfChain) && selfChain[0] ? selfChain[0] : { ...saved, chain_id: saved.id };
+    }
+
+    await insertQrSigninAudit(env, {
+      record_id: saved.id || null,
+      meeting_id: meetingId,
+      action: adminAction,
+      actor_name: actorName || null,
+      actor_employee_id: actorEmployeeId || null,
+      note: firstText(payload.note) || null,
+      before_data: {},
+      after_data: saved,
+      metadata: { source: "qr-signin-backend" }
+    });
   }
 
-  await insertQrSigninAudit(env, {
-    record_id: saved.id || null,
-    meeting_id: meetingId,
-    action: adminAction,
-    actor_name: actorName || null,
-    actor_employee_id: actorEmployeeId || null,
-    note: firstText(payload.note) || null,
-    before_data: before || {},
-    after_data: saved,
-    metadata: { source: "qr-signin-backend" }
-  });
+  // 把編輯當下合併進來的主持人/紀錄者切換，套用在「這一次」剛建立的版本上（見上方大註解）。
+  let effectiveMeeting = meeting;
+  if (before && (touchesHost || touchesRecorder)) {
+    const meetingPatch: Record<string, unknown> = {};
+    if (touchesHost) meetingPatch.host_record_id = becomesHost ? saved.id : null;
+    if (touchesRecorder) meetingPatch.recorder_record_id = becomesRecorder ? saved.id : null;
+    const meetingTable = getQrSigninMeetingTable(env);
+    const updatedMeetings = await supabasePatch<QrSigninMeetingRow[]>(env, meetingTable, `id=eq.${encodeURIComponent(meetingId)}`, meetingPatch);
+    effectiveMeeting = Array.isArray(updatedMeetings) && updatedMeetings[0] ? updatedMeetings[0] : { ...meeting, ...meetingPatch } as QrSigninMeetingRow;
+  }
 
-  const original = saved.id ? await findQrSigninRecordOriginalSnapshot(env, saved.id).catch(() => null) : null;
-  const result = qrSigninResultFromRecord(saved, meeting, original);
-  return { ok: true, action: "updateQrSigninRecord", source: "skhps-backend-supabase", table, data: result, record: result, before };
+  const original = saved.qr_origin_id ? await findQrSigninRecordById(env, saved.qr_origin_id).catch(() => null) : null;
+  const result = qrSigninResultFromRecord(saved, effectiveMeeting, original);
+  return { ok: true, action: "updateQrSigninRecord", source: "skhps-backend-supabase", table, data: result, record: result, before, meeting: effectiveMeeting ? qrSigninMeetingDisplay(effectiveMeeting) : null };
 }
 
+/*
+ * 「清除修改內容」= 還原成這個人這場會議「最早一筆真正 QR 自行簽到」（qr_origin_id
+ * 指向的那筆），不是還原成「這條版本鏈實體上最早一筆」——後台先建、QR 後到的情境下，
+ * 這兩者不是同一筆。qr_origin_id 為空代表從沒有真正 QR 簽到過，沒有基準可清，
+ * 直接回錯誤（前端也應該完全不顯示這個按鈕，見 qr-signin-backend.js 的 isEdited 判斷）。
+ */
 async function deleteQrSigninRecordEdits(env: Env, body: any) {
   const payload = normalizeRegistryPayload(body);
   const table = getQrSigninRecordTable(env);
@@ -3543,69 +3796,60 @@ async function deleteQrSigninRecordEdits(env: Env, body: any) {
   const before = await findQrSigninRecordById(env, recordId);
   if (!before) return { ok: false, action: "deleteQrSigninRecordEdits", error: "RECORD_NOT_FOUND", recordId };
 
-  const meeting = await findQrSigninMeetingRow(env, before.meeting_id).catch(() => null);
-  const roleFlags = qrSigninRecordRoleFlags(before, meeting || null);
-  const original = await findQrSigninRecordOriginalSnapshot(env, recordId);
-  if (!original && !roleFlags.isHost && !roleFlags.isRecorder) {
-    return { ok: false, action: "deleteQrSigninRecordEdits", error: "ORIGINAL_SNAPSHOT_NOT_FOUND", recordId };
+  if (!before.qr_origin_id) {
+    return { ok: false, action: "deleteQrSigninRecordEdits", error: "NO_QR_ORIGIN", recordId };
   }
 
+  const qrOrigin = await findQrSigninRecordById(env, before.qr_origin_id);
+  if (!qrOrigin) {
+    return { ok: false, action: "deleteQrSigninRecordEdits", error: "NO_QR_ORIGIN", recordId };
+  }
+
+  const meetingBefore = await findQrSigninMeetingRow(env, before.meeting_id).catch(() => null);
+  const roleFlags = qrSigninRecordRoleFlags(before, meetingBefore || null);
   const actorName = firstText(payload.actorName, payload.updatedBy, payload.operatorName);
   const actorEmployeeId = firstText(payload.actorEmployeeId, payload.operatorEmployeeId);
-  let saved: QrSigninRecordRow = before;
-  let savedMeeting: QrSigninMeetingRow | null = meeting || null;
 
-  if (original) {
-    const patch: Record<string, unknown> = {
-      name: firstText(original.name, before.name),
-      employee_id: firstText(original.employee_id, original.employeeId, before.employee_id) || null,
-      role: firstText(original.role, before.role) || null,
-      staff_source: firstText(original.staff_source, original.staffSource, before.staff_source, "StaffMaster"),
-      signed_at: firstText(original.signed_at, original.recordedSignedAt, original.signedAt, before.signed_at) || null,
-      submitted_at: firstText(original.submitted_at, original.submittedAt, before.submitted_at),
-      status: firstText(original.status, before.status, "signed"),
-      reason: firstText(original.reason) || null,
-      source: firstText(original.source, before.source, "qr"),
-      duplicate_of: firstText(original.duplicate_of, original.duplicateOf) || null,
-      client_request_id: firstText(original.client_request_id, original.clientRequestId, before.client_request_id) || null,
-      note: firstText(original.note) || null,
-      updated_by: firstText(payload.updatedBy, actorName, actorEmployeeId) || null
-    };
+  const patch: Record<string, unknown> = {
+    name: qrOrigin.name,
+    employee_id: qrOrigin.employee_id,
+    role: qrOrigin.role,
+    staff_source: qrOrigin.staff_source,
+    signed_at: qrOrigin.signed_at,
+    submitted_at: qrOrigin.submitted_at,
+    status: qrOrigin.status,
+    reason: qrOrigin.reason,
+    source: qrOrigin.source,
+    duplicate_of: qrOrigin.duplicate_of,
+    client_request_id: qrOrigin.client_request_id,
+    note: qrOrigin.note,
+    updated_by: firstText(payload.updatedBy, actorName, actorEmployeeId) || null
+  };
 
-    const updated = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(before.id)}`, patch);
-    saved = Array.isArray(updated) && updated[0] ? updated[0] : { ...before, ...patch } as QrSigninRecordRow;
-  }
+  const versioned = await createQrSigninRecordVersion(env, before, patch, "clear-record-edits", {
+    actorName,
+    actorEmployeeId,
+    note: firstText(payload.note),
+    metadata: { restoreOriginal: true, clearHost: roleFlags.isHost, clearRecorder: roleFlags.isRecorder }
+  });
+  const saved = versioned.saved;
+  let savedMeeting = versioned.meeting;
 
-  if (meeting && (roleFlags.isHost || roleFlags.isRecorder)) {
+  // 「清除」本身就是要把主持人/紀錄者身分一起清掉，優先權高於
+  // createQrSigninRecordVersion 內建的「host/recorder 指標跟著新版本走」。
+  if (savedMeeting && (roleFlags.isHost || roleFlags.isRecorder)) {
     const meetingPatch: Record<string, unknown> = {
-      updated_by: firstText(payload.updatedBy, actorName, actorEmployeeId) || meeting.updated_by || null
+      updated_by: firstText(payload.updatedBy, actorName, actorEmployeeId) || savedMeeting.updated_by || null
     };
     if (roleFlags.isHost) meetingPatch.host_record_id = null;
     if (roleFlags.isRecorder) meetingPatch.recorder_record_id = null;
-    const updatedMeetings = await supabasePatch<QrSigninMeetingRow[]>(env, meetingTable, `id=eq.${encodeURIComponent(meeting.id)}`, meetingPatch);
+    const updatedMeetings = await supabasePatch<QrSigninMeetingRow[]>(env, meetingTable, `id=eq.${encodeURIComponent(savedMeeting.id)}`, meetingPatch);
     savedMeeting = Array.isArray(updatedMeetings) && updatedMeetings[0]
       ? updatedMeetings[0]
-      : { ...meeting, ...meetingPatch } as QrSigninMeetingRow;
+      : { ...savedMeeting, ...meetingPatch } as QrSigninMeetingRow;
   }
 
-  await insertQrSigninAudit(env, {
-    record_id: saved.id || null,
-    meeting_id: before.meeting_id,
-    action: "delete-record-edits",
-    actor_name: actorName || null,
-    actor_employee_id: actorEmployeeId || null,
-    note: firstText(payload.note) || null,
-    before_data: before,
-    after_data: saved,
-    metadata: {
-      source: "qr-signin-backend",
-      restoreOriginal: Boolean(original),
-      clearHost: roleFlags.isHost,
-      clearRecorder: roleFlags.isRecorder
-    }
-  });
-
-  const result = qrSigninResultFromRecord(saved, savedMeeting, original || null);
+  const result = qrSigninResultFromRecord(saved, savedMeeting, qrOrigin);
   const meetingDisplay = savedMeeting ? qrSigninMeetingDisplay(savedMeeting) : null;
   return {
     ok: true,
@@ -4233,6 +4477,130 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
         ok: false,
         action,
         source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "syncLocalDevFromProd") {
+    try {
+      // 1. 同步會議表
+      const meetingTable = getQrSigninMeetingTable(env);
+      let allProdMeetings: QrSigninMeetingRow[] = [];
+      let offset = 0;
+      const pageSize = 1000;
+      
+      console.log("Starting to query prod meetings...");
+      while (true) {
+        const pageMeetings = await supabaseGet<QrSigninMeetingRow[]>(
+          env,
+          `${encodeURIComponent(meetingTable)}?select=*&env=eq.prod&enabled=eq.true&status=eq.active&order=created_at.asc&limit=${pageSize}&offset=${offset}`
+        ).catch((e) => {
+          console.log("Query meetings error:", e);
+          return [] as QrSigninMeetingRow[];
+        });
+        
+        console.log(`Queried meetings at offset ${offset}: ${Array.isArray(pageMeetings) ? pageMeetings.length : 'error'} results`);
+        if (!Array.isArray(pageMeetings) || pageMeetings.length === 0) break;
+        allProdMeetings = allProdMeetings.concat(pageMeetings);
+        
+        if (pageMeetings.length < pageSize) break;
+        offset += pageSize;
+      }
+      
+      console.log(`Total prod meetings fetched: ${allProdMeetings.length}`);
+      
+      // 刪除所有 local-dev 會議
+      await supabaseDelete(env, meetingTable, "env=eq.local-dev").catch(() => null);
+      
+      // 批量複製會議（不保留 ID，讓 Supabase 生成新 ID）
+      const meetingsToInsert: Record<string, unknown>[] = [];
+      const meetingIdMap = new Map<string, string>(); // prod id => local-dev id mapping
+      for (const meeting of allProdMeetings) {
+        const prodId = meeting.id;
+        const newMeeting: Record<string, unknown> = {};
+        for (const [key, value] of Object.entries(meeting)) {
+          if (key !== "id") {
+            newMeeting[key] = key === "env" ? "local-dev" : value;
+          }
+        }
+        meetingsToInsert.push(newMeeting);
+      }
+      console.log(`Prepared ${meetingsToInsert.length} meetings for insert (IDs not preserved, will be auto-generated)`);
+      
+      let meetingsInserted = 0;
+      if (meetingsToInsert.length > 0) {
+        const baseUrl = getSupabaseBaseUrl(env);
+        console.log(`Attempting to insert ${meetingsToInsert.length} meetings one by one...`);
+        
+        for (let i = 0; i < meetingsToInsert.length; i++) {
+          const meeting = meetingsToInsert[i];
+          try {
+            const meetingResponse = await fetch(`${baseUrl}/rest/v1/${encodeURIComponent(meetingTable)}`, {
+              method: "POST",
+              headers: {
+                ...getSupabaseHeaders(env),
+                "Prefer": "return=representation"
+              },
+              body: JSON.stringify(meeting)
+            });
+            
+            if (meetingResponse.ok) {
+              meetingsInserted++;
+              if (i % 5 === 0) {
+                console.log(`Inserted ${meetingsInserted}/${meetingsToInsert.length} meetings`);
+              }
+            } else {
+              const errorText = await meetingResponse.text();
+              console.log(`Meeting ${i} insert failed (${meetingResponse.status}): ${errorText.substring(0, 200)}`);
+            }
+          } catch (e) {
+            console.log(`Meeting ${i} insert error: ${e}`);
+          }
+        }
+        console.log(`Finished inserting meetings: ${meetingsInserted}/${meetingsToInsert.length}`);
+      } else {
+        console.log("No meetings to insert");
+      }
+      
+      // 2. 暫時跳過記錄複製
+      let recordsInserted = 0;
+      
+      return json({
+        ok: true,
+        action,
+        message: `Synced ${meetingsInserted} meetings (records sync skipped) from prod to local-dev`,
+        meetings: { copied: meetingsInserted, total: allProdMeetings.length },
+        records: { copied: recordsInserted, total: 0 }
+      });
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "resetLocalDevSourceToQr") {
+    try {
+      const table = getQrSigninRecordTable(env);
+      const result = await supabasePatch(
+        env,
+        table,
+        "env=eq.local-dev",
+        { source: "qr" }
+      );
+      return json({
+        ok: true,
+        action,
+        message: "All local-dev records source reset to qr",
+        result
+      });
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
         error: error instanceof Error ? error.message : String(error)
       }, 500);
     }
