@@ -3267,8 +3267,6 @@ async function submitQrSignin(env: Env, body: any) {
       action: "duplicate-signin",
       actor_name: name,
       actor_employee_id: employeeId || null,
-      before_data: existing,
-      after_data: existing,
       metadata: {
         source: "submitQrSignin",
         duplicateOf: existing.id
@@ -3316,8 +3314,10 @@ async function submitQrSignin(env: Env, body: any) {
           action: "resolve-failed-signin",
           actor_name: name,
           actor_employee_id: employeeId || null,
+          // 這個分支是 PATCH 蓋掉 existing（isOwnQrRetry，同一鏈原地更新，不走版本化），
+          // before_data 是 existing 被覆蓋前唯一還留得住的快照，不能省；after_data
+          // 拿掉是因為那就是 saved 現在這一列本身，Record 表已經有了。
           before_data: existing,
-          after_data: saved,
           metadata: { source: "submitQrSignin" }
         });
       } else {
@@ -3357,8 +3357,9 @@ async function submitQrSignin(env: Env, body: any) {
         action: "repeated-failed-signin",
         actor_name: name,
         actor_employee_id: employeeId || null,
+        // 同上：這個分支也是 PATCH 蓋掉 existing，before_data 是唯一存活快照，留著；
+        // after_data 省略（就是 saved，Record 表本身已經有）。
         before_data: existing,
-        after_data: saved,
         metadata: {
           source: "submitQrSignin",
           attemptedStatus: statusInfo.status,
@@ -3415,7 +3416,7 @@ async function submitQrSignin(env: Env, body: any) {
     action: statusInfo.status === "signed" ? "qr-signin" : "failed-signin",
     actor_name: name,
     actor_employee_id: employeeId || null,
-    after_data: saved,
+    // 這是全新一條鏈的第一筆，saved 本身就永久留在 Record 表，不用再存一份 after_data。
     metadata: { source: "submitQrSignin" }
   });
   const result = qrSigninResultFromRecord(saved, meeting);
@@ -3574,8 +3575,8 @@ async function createQrSigninRecordVersion(
     actor_name: auditMeta.actorName || null,
     actor_employee_id: auditMeta.actorEmployeeId || null,
     note: auditMeta.note || null,
-    before_data: previous,
-    after_data: saved,
+    // previous 和 saved 都是版本鏈上的實體列，永久留在 Record 表裡（previous.id 就是
+    // saved.supersedes_id），這裡不用再各存一份全量 JSONB 快照，只留事件本身。
     metadata: { source: "qr-signin-backend", ...(auditMeta.metadata || {}) }
   });
 
@@ -3757,8 +3758,7 @@ async function updateQrSigninRecord(env: Env, body: any) {
       actor_name: actorName || null,
       actor_employee_id: actorEmployeeId || null,
       note: firstText(payload.note) || null,
-      before_data: {},
-      after_data: saved,
+      // 全新一條鏈，沒有 before 可言；saved 本身永久留在 Record 表，不用再存 after_data。
       metadata: { source: "qr-signin-backend" }
     });
   }
