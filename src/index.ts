@@ -2596,7 +2596,19 @@ async function listQrSigninMeetingRows(env: Env, appEnv: AppEnvName, limit = 200
     env,
     `${encodeURIComponent(table)}?select=*&env=eq.${encodeURIComponent(appEnv)}&enabled=eq.true&status=eq.active&order=starts_at.desc.nullslast&limit=${limit}`
   );
-  return rows;
+  
+  // 過濾出未來15天內的會議
+  const now = Date.now();
+  const futureWindow = 15 * 24 * 60 * 60 * 1000; // 15 days in milliseconds
+  const futureLimit = now + futureWindow;
+  
+  return rows.filter((row) => {
+    if (!row.starts_at) return true; // 沒有開始時間的會議保留
+    const startsAt = Date.parse(row.starts_at);
+    if (!Number.isFinite(startsAt)) return true;
+    // 顯示未來15天內的會議
+    return startsAt <= futureLimit;
+  });
 }
 
 async function countQrSigninRecordsByMeeting(env: Env, meetingId: string): Promise<number> {
