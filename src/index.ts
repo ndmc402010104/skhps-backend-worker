@@ -3414,12 +3414,12 @@ async function updateQrSigninRecord(env: Env, body: any) {
   }
 
   // 根據新邏輯判斷 source：比對新內容是否與原始 QR 記錄相同
-  let computedSource = "admin";  // 預設為後台修改
+  let computedSource = before ? before.source : "admin";  // 預設用現在的 source
   
   if (status !== "manual" && status !== "leave" && before) {
     // 取得原始快照來比對
     const original = await findQrSigninRecordOriginalSnapshot(env, before.id).catch(() => null);
-    if (original && original.source === "qr") {
+    if (original) {
       // 構建新的內容物件（用於比對）
       const newContent = {
         name,
@@ -3431,13 +3431,16 @@ async function updateQrSigninRecord(env: Env, body: any) {
       const currentComparable = qrRecordComparable(newContent);
       const originalComparable = qrRecordComparable(original);
       
-      // 如果與原始內容完全相同，改回 "qr"
+      // 如果與原始內容完全相同，改回原始 source（通常是 "qr"）
       const isUnchanged = Object.keys(currentComparable).every(
         (key) => String(currentComparable[key] || "") === String(originalComparable[key] || "")
       );
       
       if (isUnchanged) {
-        computedSource = "qr";
+        computedSource = original.source || "admin";
+      } else {
+        // 內容改變過，標記為後台修改
+        computedSource = "admin";
       }
     }
   }
