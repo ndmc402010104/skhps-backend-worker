@@ -3008,6 +3008,9 @@ function qrSigninRecordRoleFlags(row: QrSigninRecordRow, meeting?: QrSigninMeeti
 }
 
 function qrSigninRecordContentEditedFromOriginal(row: QrSigninRecordRow, original?: Record<string, unknown> | null): boolean {
+  // 如果 source 是 "admin"，表示後台修改過，直接返回 true
+  if (row.source === "admin") return true;
+  
   if (!original) return row.source !== "qr";
   const current = qrRecordComparable(row);
   const base = qrRecordComparable(original);
