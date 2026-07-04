@@ -2599,6 +2599,17 @@ async function listQrSigninMeetingRows(env: Env, appEnv: AppEnvName, limit = 200
   return rows;
 }
 
+async function countQrSigninRecordsByMeeting(env: Env, meetingId: string): Promise<number> {
+  const table = getQrSigninRecordTable(env);
+  const rows = await supabaseGet<Array<{ count: string }>>(
+    env,
+    `${encodeURIComponent(table)}?select=count&meeting_id=eq.${encodeURIComponent(meetingId)}&status=not.in.(void,duplicate,error)`
+  );
+  
+  const countHeader = rows.length > 0 ? rows[0].count : "0";
+  return parseInt(String(countHeader || "0"), 10);
+}
+
 async function findQrSigninMeetingBySource(env: Env, row: Record<string, unknown>): Promise<QrSigninMeetingRow | null> {
   const table = getQrSigninMeetingTable(env);
   const envName = firstText(row.env);
@@ -2714,21 +2725,29 @@ async function getQrSigninMeetings(env: Env, body: any) {
     }
   }
 
-  const meetings = rows.map(qrSigninMeetingDisplay);
+  // 並行查詢每個會議的簽到記錄數
+  const meetingsWithCounts = await Promise.all(rows.map(async (row) => {
+    const display = qrSigninMeetingDisplay(row);
+    const signinCount = await countQrSigninRecordsByMeeting(env, row.id).catch(() => 0);
+    return {
+      ...display,
+      signinRecordCount: signinCount
+    };
+  }));
 
   return {
     ok: true,
     action: "getQrSigninMeetings",
     source: syncSource,
     table: getQrSigninMeetingTable(env),
-    count: meetings.length,
+    count: meetingsWithCounts.length,
     data: {
       ok: true,
-      meetings,
+      meetings: meetingsWithCounts,
       source: syncSource,
       syncError
     },
-    meetings,
+    meetings: meetingsWithCounts,
     diagnostics: {
       syncSource,
       syncError,
