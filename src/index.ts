@@ -2822,24 +2822,26 @@ async function updateQrSigninMeetingSelection(env: Env, body: any) {
   if (!before) return { ok: false, action: "updateQrSigninMeetingSelection", error: "MEETING_NOT_FOUND", meetingId };
 
   const requestedSelection = normalizeSwipeSelectionPayload(payload.selectionState || payload.swipeTableSelection || {});
-  const nextSelection = {
-    singleSelects: {
-      host: before.host_record_id || "",
-      recorder: before.recorder_record_id || "",
-      ...requestedSelection.singleSelects
-    },
-    multiSelects: {}
-  };
 
+  /*
+   * 只 PATCH 這個請求「明講」的 key：selectionState 有值、或 clearSingleSelects 點名清空。
+   * 禁止拿 before 的舊值回填沒提到的 key 再整包寫回——前端一次編輯儲存若同時動到
+   * 主持人＋紀錄者，會各發一個請求並發進來，read-merge-write 會把另一個請求剛清掉的
+   * 欄位用讀到的舊值寫回（結果主持人、紀錄者兩個都打勾）。沒提到的 key 一律不碰，
+   * 兩個並發請求寫的欄位彼此不相交，落地順序就不影響最終結果。
+   */
+  const clearedKeys = new Set<string>();
   if (payload.clearSingleSelects && Array.isArray(payload.clearSingleSelects)) {
     payload.clearSingleSelects.forEach((key) => {
       const cleanKey = String(key || "").trim();
-      if (cleanKey === "host" || cleanKey === "recorder") nextSelection.singleSelects[cleanKey] = "";
+      if (cleanKey === "host" || cleanKey === "recorder") clearedKeys.add(cleanKey);
     });
   }
 
-  const requestedHostRecordId = firstText(nextSelection.singleSelects.host);
-  const requestedRecorderRecordId = firstText(nextSelection.singleSelects.recorder);
+  const requestedHostRecordId = clearedKeys.has("host") ? "" : firstText(requestedSelection.singleSelects.host);
+  const requestedRecorderRecordId = clearedKeys.has("recorder") ? "" : firstText(requestedSelection.singleSelects.recorder);
+  const touchesHost = clearedKeys.has("host") || Boolean(requestedHostRecordId);
+  const touchesRecorder = clearedKeys.has("recorder") || Boolean(requestedRecorderRecordId);
 
   if (requestedHostRecordId) {
     const hostRecord = await findQrSigninRecordInMeeting(env, meetingId, requestedHostRecordId).catch(() => null);
@@ -2858,16 +2860,25 @@ async function updateQrSigninMeetingSelection(env: Env, body: any) {
   const patch: Record<string, unknown> = {
     updated_by: firstText(payload.updatedBy, payload.actorName, payload.actorEmployeeId) || before.updated_by || null
   };
-  if (Object.prototype.hasOwnProperty.call(nextSelection.singleSelects, "host")) {
-    patch.host_record_id = nextSelection.singleSelects.host || null;
+  if (touchesHost) {
+    patch.host_record_id = requestedHostRecordId || null;
   }
-  if (Object.prototype.hasOwnProperty.call(nextSelection.singleSelects, "recorder")) {
-    patch.recorder_record_id = nextSelection.singleSelects.recorder || null;
+  if (touchesRecorder) {
+    patch.recorder_record_id = requestedRecorderRecordId || null;
   }
 
   const updated = await supabasePatch<QrSigninMeetingRow[]>(env, table, `id=eq.${encodeURIComponent(meetingId)}`, patch);
   const saved = Array.isArray(updated) && updated[0] ? updated[0] : { ...before, ...patch } as QrSigninMeetingRow;
   const meeting = qrSigninMeetingDisplay(saved);
+
+  // 回應的 selectionState 以 PATCH 後 DB 實際存的值為準，不是用請求內容拼出來的。
+  const nextSelection = {
+    singleSelects: {
+      host: saved.host_record_id || "",
+      recorder: saved.recorder_record_id || ""
+    },
+    multiSelects: {}
+  };
 
   return {
     ok: true,
