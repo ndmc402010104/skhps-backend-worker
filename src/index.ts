@@ -3021,8 +3021,9 @@ function qrSigninRecordEditedFromOriginal(row: QrSigninRecordRow, original?: Rec
 }
 
 function qrSigninOriginalSource(row: QrSigninRecordRow, original?: Record<string, unknown> | null, isEdited?: boolean): string {
-  if (isEdited) return "admin";
-  return firstText(original && original.source, row.source, "qr");
+  // 新邏輯：直接返回記錄中存儲的 source 值，不再根據 isEdited 改變
+  // source 值已在寫入時根據與原始記錄的比對結果決定
+  return firstText(row && row.source, "admin");
 }
 
 async function findQrSigninRecordOriginalSnapshot(env: Env, recordId: string): Promise<Record<string, unknown> | null> {
@@ -3209,6 +3210,7 @@ async function submitQrSignin(env: Env, body: any) {
         signed_at: signedAt,
         status: "signed",
         reason: null,
+        source: "qr",
         client_request_id: clientRequestId || null
       };
       const updated = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(existing.id)}`, patch);
@@ -3239,6 +3241,7 @@ async function submitQrSignin(env: Env, body: any) {
       signed_at: signedAt,
       status: statusInfo.status,
       reason: statusInfo.reason || null,
+      source: "qr",
       client_request_id: clientRequestId || null
     };
     const updated = await supabasePatch<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(existing.id)}`, patch);
@@ -3410,13 +3413,44 @@ async function updateQrSigninRecord(env: Env, body: any) {
     before = await findCurrentQrSigninRecord(env, { meetingId, employeeId, name }).catch(() => null);
   }
 
+  // 根據新邏輯判斷 source：比對新內容是否與原始 QR 記錄相同
+  let computedSource = status === "manual" || status === "leave" ? "admin" : firstText(payload.source, before && before.source, "admin");
+  
+  if (before) {
+    // 取得原始快照來比對
+    const original = await findQrSigninRecordOriginalSnapshot(env, before.id).catch(() => null);
+    if (original) {
+      // 構建新的內容物件（用於比對）
+      const newContent = {
+        name,
+        employee_id: employeeId || null,
+        role: role || null,
+        signed_at: signedAt,
+        status
+      };
+      const currentComparable = qrRecordComparable(newContent);
+      const originalComparable = qrRecordComparable(original);
+      
+      // 如果與原始內容完全相同，改回 "qr"
+      const isUnchanged = Object.keys(currentComparable).every(
+        (key) => String(currentComparable[key] || "") === String(originalComparable[key] || "")
+      );
+      
+      if (isUnchanged && (original && original.source === "qr")) {
+        computedSource = "qr";
+      } else {
+        computedSource = "admin";
+      }
+    }
+  }
+
   const patch: Record<string, unknown> = {
     name,
     employee_id: employeeId || null,
     role: role || null,
     status,
     reason: reason || null,
-    source: status === "manual" || status === "leave" ? "admin" : firstText(payload.source, before && before.source, "admin"),
+    source: computedSource,
     updated_by: firstText(payload.updatedBy, actorName, actorEmployeeId) || null,
     note: firstText(payload.note, before && before.note) || null
   };
