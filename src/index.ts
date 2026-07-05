@@ -2796,14 +2796,25 @@ async function previewQrSigninCalendarMeetings(env: Env, body: any) {
       const fallback = await callQrSigninAppsScriptFallback(env, "getQrSigninMeetings", { ...payload, env: appEnv }) as any;
       const data = fallback && fallback.data ? fallback.data : fallback;
       const meetings = data && Array.isArray(data.meetings) ? data.meetings : [];
-      rows = meetings.map((meeting: any) => toQrSigninMeetingRowFromLegacy({
-        envName: appEnv,
-        course: meeting.course || meeting.title,
-        date: meeting.date || meeting.time || meeting.timeLabel,
-        source: "apps-script-calendar",
-        sourceId: firstText(meeting.calendarEventId, meeting.sourceId, meeting.id, meeting.eventId, meeting.uid),
-        metadata: { rawSource: "apps-script", rawMeeting: meeting }
-      }));
+      const lookaheadDays = qrNumberFromEnv(payload.lookaheadDays, qrNumberFromEnv(env.QR_SIGNIN_CALENDAR_LOOKAHEAD_DAYS, DEFAULT_QR_SIGNIN_LOOKAHEAD_DAYS));
+      const nowMs = Date.now();
+      const lookaheadLimitMs = nowMs + lookaheadDays * 86400000;
+      rows = meetings
+        .map((meeting: any) => toQrSigninMeetingRowFromLegacy({
+          envName: appEnv,
+          course: meeting.course || meeting.title,
+          date: meeting.date || meeting.time || meeting.timeLabel,
+          source: "apps-script-calendar",
+          sourceId: firstText(meeting.calendarEventId, meeting.sourceId, meeting.id, meeting.eventId, meeting.uid),
+          metadata: { rawSource: "apps-script", rawMeeting: meeting }
+        }))
+        // Apps Script 的舊端點沒有日期窗口概念，回傳的是全部歷史場次；這裡跟 ICS
+        // 那條路徑一樣，只留「現在到 lookaheadDays 天內」的未來場次，避免這個純預覽
+        // 用途的清單混進一堆過去、從沒人簽到過的舊會議。
+        .filter((row: Record<string, unknown>) => {
+          const startsAt = row.starts_at ? Date.parse(String(row.starts_at)) : NaN;
+          return Number.isFinite(startsAt) && startsAt >= nowMs && startsAt <= lookaheadLimitMs;
+        });
       source = "apps-script-calendar";
       syncError = icsError instanceof Error ? icsError.message : String(icsError);
     } catch (fallbackError) {
