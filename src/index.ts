@@ -2768,6 +2768,96 @@ async function getQrSigninMeetings(env: Env, body: any) {
   };
 }
 
+/*
+ * 純預覽用：解析 ICS / Apps Script 回傳的日曆事件，但完全不呼叫
+ * saveQrSigninMeetingRows，不會在 QrSigninMeeting 產生任何 DB row。
+ * 之後前端要不要把某一場「變成真的會議」，走既有的 lazy-create 路徑
+ * （後台 resolveMeetingId 按新增人員／前台 submitQrSignin 真的有人簽到），
+ * 不是每次列清單就順手幫每個日曆事件都建一筆——避免大量從沒人簽到過的
+ * 空會議塞滿 QrSigninMeeting。
+ */
+async function previewQrSigninCalendarMeetings(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const appEnv = normalizeEnv(firstText(body.env, payload.env));
+  let rows: Record<string, unknown>[] = [];
+  let source = "";
+  let syncError = "";
+
+  try {
+    const icsUrl = getQrSigninCalendarIcsUrl(env);
+    if (!icsUrl) throw new Error("QR_SIGNIN_CALENDAR_ICS_URL_MISSING");
+    const response = await fetch(icsUrl, { method: "GET" });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`QR_SIGNIN_ICS_FETCH_FAILED ${response.status} ${text.slice(0, 200)}`);
+    rows = parseQrSigninIcsRows(text, env, { ...payload, env: appEnv, lookbackDays: 0 });
+    source = "google-calendar-ics";
+  } catch (icsError) {
+    try {
+      const fallback = await callQrSigninAppsScriptFallback(env, "getQrSigninMeetings", { ...payload, env: appEnv }) as any;
+      const data = fallback && fallback.data ? fallback.data : fallback;
+      const meetings = data && Array.isArray(data.meetings) ? data.meetings : [];
+      rows = meetings.map((meeting: any) => toQrSigninMeetingRowFromLegacy({
+        envName: appEnv,
+        course: meeting.course || meeting.title,
+        date: meeting.date || meeting.time || meeting.timeLabel,
+        source: "apps-script-calendar",
+        sourceId: firstText(meeting.calendarEventId, meeting.sourceId, meeting.id, meeting.eventId, meeting.uid),
+        metadata: { rawSource: "apps-script", rawMeeting: meeting }
+      }));
+      source = "apps-script-calendar";
+      syncError = icsError instanceof Error ? icsError.message : String(icsError);
+    } catch (fallbackError) {
+      syncError = [icsError, fallbackError].map((error) => error instanceof Error ? error.message : String(error)).filter(Boolean).join(" | ");
+    }
+  }
+
+  const meetings = rows.map((row) => qrSigninCalendarPreviewDisplay(row));
+
+  return {
+    ok: true,
+    action: "previewQrSigninCalendarMeetings",
+    source,
+    count: meetings.length,
+    data: { ok: true, meetings, source, syncError },
+    meetings
+  };
+}
+
+function qrSigninCalendarPreviewDisplay(row: Record<string, unknown>): Record<string, unknown> {
+  const startsAt = String(row.starts_at || "");
+  const endsAt = String(row.ends_at || "");
+  const start = startsAt ? new Date(startsAt) : null;
+  const datePrefix = start && Number.isFinite(start.getTime()) ? formatTaipeiDate(start, "M/d") : String(row.meeting_date || "");
+  const title = String(row.title || "");
+  const course = datePrefix ? `${datePrefix} ${title}` : title;
+
+  return {
+    id: "",
+    meetingId: "",
+    course,
+    date: row.time_label || "",
+    title,
+    meetingDate: row.meeting_date || "",
+    timeLabel: row.time_label || "",
+    startTime: startsAt,
+    endTime: endsAt,
+    isRunning: false,
+    selected: false,
+    source: row.source || "",
+    sourceId: row.source_id || "",
+    calendarEventId: row.source_id || "",
+    calendarId: row.calendar_id || "",
+    status: row.status || "active",
+    enabled: row.enabled !== false,
+    updatedAt: "",
+    metadata: row.metadata || {},
+    hostRecordId: "",
+    recorderRecordId: "",
+    signinRecordCount: 0,
+    selectionState: { singleSelects: {}, multiSelects: {} }
+  };
+}
+
 async function createQrSigninMeeting(env: Env, body: any) {
   const payload = normalizeRegistryPayload(body);
   const appEnv = normalizeEnv(firstText(body.env, payload.env));
@@ -3717,10 +3807,11 @@ async function updateQrSigninRecord(env: Env, body: any) {
     note: firstText(payload.note, before && before.note) || null
   };
 
-  if (status === "manual" || status === "signed") {
-    patch.signed_at = signedAt;
-    patch.submitted_at = before ? before.submitted_at : signedAt;
-  }
+  // 編輯表單的簽到時間欄位不管簽到狀態是什麼都可以改，之前只有 manual/signed
+  // 兩種狀態才會把 signedAt 寫進 patch，導致其他狀態（outside_window/leave/absent…）
+  // 編輯時間欄位存了也是白存，畫面看起來改了、重新整理又打回原本的值。
+  patch.signed_at = signedAt;
+  patch.submitted_at = before ? before.submitted_at : signedAt;
 
   let saved: QrSigninRecordRow;
   if (before) {
@@ -4343,6 +4434,20 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
     }
   }
 
+
+  if (action === "previewQrSigninCalendarMeetings") {
+    try {
+      const result = await previewQrSigninCalendarMeetings(env, body);
+      return json(result, result.ok === false ? 502 : 200);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
 
   if (action === "getQrSigninMeeting") {
     try {
