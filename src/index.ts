@@ -4059,40 +4059,300 @@ async function deleteQrSigninRecord(env: Env, body: any) {
   };
 }
 
-function csvCell(value: unknown): string {
-  const text = String(value === undefined || value === null ? "" : value);
-  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+/*
+ * 最小 .xlsx 寫檔實作：Worker 沒有裝任何 xlsx 套件，這裡跟 PDF exporter
+ * 同一套風格，直接手刻 ZIP + 最小 OOXML 結構，不引入外部依賴。
+ * ZIP 一律用 STORED（不壓縮），省掉自己刻 DEFLATE 演算法的麻煩；檔案不大，
+ * 不壓縮換來的檔案體積增加可以接受。每個 sheet 儲存格都用 inlineStr，
+ * 不用 sharedStrings.xml，少一個檔案、邏輯單純。
+ */
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) {
+      c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(data: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < data.length; i += 1) {
+    crc = CRC32_TABLE[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+interface ZipEntry {
+  name: string;
+  data: Uint8Array;
+}
+
+function buildZip(entries: ZipEntry[]): Uint8Array {
+  const encoder = new TextEncoder();
+  const now = new Date();
+  const dosTime = ((now.getHours() & 0x1f) << 11) | ((now.getMinutes() & 0x3f) << 5) | ((now.getSeconds() >> 1) & 0x1f);
+  const dosDate = (((now.getFullYear() - 1980) & 0x7f) << 9) | (((now.getMonth() + 1) & 0xf) << 5) | (now.getDate() & 0x1f);
+  const localParts: Uint8Array[] = [];
+  const centralParts: Uint8Array[] = [];
+  let offset = 0;
+
+  entries.forEach((entry) => {
+    const nameBytes = encoder.encode(entry.name);
+    const data = entry.data;
+    const crc = crc32(data);
+
+    const localHeader = new Uint8Array(30 + nameBytes.length);
+    const lv = new DataView(localHeader.buffer);
+    lv.setUint32(0, 0x04034b50, true);
+    lv.setUint16(4, 20, true);
+    lv.setUint16(6, 0, true);
+    lv.setUint16(8, 0, true);
+    lv.setUint16(10, dosTime, true);
+    lv.setUint16(12, dosDate, true);
+    lv.setUint32(14, crc, true);
+    lv.setUint32(18, data.length, true);
+    lv.setUint32(22, data.length, true);
+    lv.setUint16(26, nameBytes.length, true);
+    lv.setUint16(28, 0, true);
+    localHeader.set(nameBytes, 30);
+    localParts.push(localHeader, data);
+
+    const centralHeader = new Uint8Array(46 + nameBytes.length);
+    const cv = new DataView(centralHeader.buffer);
+    cv.setUint32(0, 0x02014b50, true);
+    cv.setUint16(4, 20, true);
+    cv.setUint16(6, 20, true);
+    cv.setUint16(8, 0, true);
+    cv.setUint16(10, 0, true);
+    cv.setUint16(12, dosTime, true);
+    cv.setUint16(14, dosDate, true);
+    cv.setUint32(16, crc, true);
+    cv.setUint32(20, data.length, true);
+    cv.setUint32(24, data.length, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint16(30, 0, true);
+    cv.setUint16(32, 0, true);
+    cv.setUint16(34, 0, true);
+    cv.setUint16(36, 0, true);
+    cv.setUint32(38, 0, true);
+    cv.setUint32(42, offset, true);
+    centralHeader.set(nameBytes, 46);
+    centralParts.push(centralHeader);
+
+    offset += localHeader.length + data.length;
+  });
+
+  const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
+  const centralOffset = offset;
+
+  const endRecord = new Uint8Array(22);
+  const ev = new DataView(endRecord.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(4, 0, true);
+  ev.setUint16(6, 0, true);
+  ev.setUint16(8, entries.length, true);
+  ev.setUint16(10, entries.length, true);
+  ev.setUint32(12, centralSize, true);
+  ev.setUint32(16, centralOffset, true);
+  ev.setUint16(20, 0, true);
+
+  const result = new Uint8Array(offset + centralSize + endRecord.length);
+  let pos = 0;
+  localParts.forEach((part) => { result.set(part, pos); pos += part.length; });
+  centralParts.forEach((part) => { result.set(part, pos); pos += part.length; });
+  result.set(endRecord, pos);
+  return result;
+}
+
+function xmlEscape(value: unknown): string {
+  return String(value === undefined || value === null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function xlsxColumnLetter(index: number): string {
+  let n = index + 1;
+  let letters = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    letters = String.fromCharCode(65 + rem) + letters;
+    n = Math.floor((n - 1) / 26);
+  }
+  return letters;
+}
+
+function buildXlsxSheetXml(header: string[], rows: string[][]): string {
+  const allRows = [header, ...rows];
+  const rowsXml = allRows.map((cells, rowIndex) => {
+    const r = rowIndex + 1;
+    const cellsXml = cells.map((cellValue, colIndex) => {
+      const ref = xlsxColumnLetter(colIndex) + r;
+      const text = xmlEscape(cellValue);
+      return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${text}</t></is></c>`;
+    }).join("");
+    return `<row r="${r}">${cellsXml}</row>`;
+  }).join("");
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${rowsXml}</sheetData></worksheet>`;
+}
+
+function buildMinimalXlsx(header: string[], rows: string[][]): Uint8Array {
+  const encoder = new TextEncoder();
+  const contentTypes = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>';
+  const rootRels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>';
+  const workbookXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>';
+  const workbookRels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>';
+  const sheetXml = buildXlsxSheetXml(header, rows);
+
+  return buildZip([
+    { name: "[Content_Types].xml", data: encoder.encode(contentTypes) },
+    { name: "_rels/.rels", data: encoder.encode(rootRels) },
+    { name: "xl/workbook.xml", data: encoder.encode(workbookXml) },
+    { name: "xl/_rels/workbook.xml.rels", data: encoder.encode(workbookRels) },
+    { name: "xl/worksheets/sheet1.xml", data: encoder.encode(sheetXml) }
+  ]);
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+const XLSX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+/*
+ * 匯出檔名跟前端「簽到單 PDF」（[meetingDate, meeting.title, "簽到單.pdf"].join("-")）
+ * 用同一套命名邏輯：{會議日期}-{會議名稱}-{suffix}.xlsx，只是 suffix 換成
+ * 「簽到上傳」或「簽到原始檔案」。找不到會議資料時退回今天日期跟通用名稱。
+ */
+async function qrExportFilename(env: Env, meetingId: string, suffix: string): Promise<string> {
+  const meeting = meetingId ? await findQrSigninMeetingRow(env, meetingId).catch(() => null) : null;
+  const meetingDate = firstText(meeting && meeting.meeting_date) || new Date().toISOString().slice(0, 10);
+  const title = firstText(meeting && meeting.title) || "會議";
+  return [meetingDate, title, suffix].filter(Boolean).join("-") + ".xlsx";
+}
+
+/*
+ * exportQrSigninRecords 回傳的 row.signedAt 是 ISO 字串（UTC），CSV 給人看的
+ * 欄位要轉成台北時間、人類看得懂的「YYYY/MM/DD HH:mm」，不能直接印 ISO 原文。
+ */
+function formatTaipeiDisplayDateTime(value: unknown): string {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) return text;
+  const taipei = new Date(date.getTime() + 8 * 60 * 60 * 1000);
+  return [
+    taipei.getUTCFullYear(),
+    pad2(taipei.getUTCMonth() + 1),
+    pad2(taipei.getUTCDate())
+  ].join("/") + " " + [
+    pad2(taipei.getUTCHours()),
+    pad2(taipei.getUTCMinutes())
+  ].join(":");
+}
+
+// 「簽到上傳格式」的簽到時間只要 07:30 這種時分，不用帶年月日。
+function formatTaipeiTimeOnly(value: unknown): string {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) return text;
+  const taipei = new Date(date.getTime() + 8 * 60 * 60 * 1000);
+  return [pad2(taipei.getUTCHours()), pad2(taipei.getUTCMinutes())].join(":");
+}
+
+/*
+ * exportQrSigninRecords 回傳的 row.status 是 qrSigninFrontendStatus() 那套
+ * success/duplicate/closed/raw 狀態，不是給人看的中文——CSV 要用跟 Swipe Table
+ * 一致的 4 種中文狀態（已簽到/請假/未簽到/未於時限內簽到）。
+ */
+function qrCsvStatusLabel(status: unknown): string {
+  const normalized = qrRecordStatusComparable(status);
+  if (normalized === "signed") return "已簽到";
+  if (normalized === "outside_window") return "未於時限內簽到";
+  if (normalized === "leave") return "請假";
+  return "未簽到";
+}
+
+// 給「另一個簽到上傳」格式用：狀態只能是出席/未簽到，不分是哪一種沒出席。
+function qrCsvAttendanceLabel(status: unknown): string {
+  return qrRecordStatusComparable(status) === "signed" ? "出席" : "未簽到";
 }
 
 async function exportQrSigninRecords(env: Env, body: any) {
   const payload = normalizeRegistryPayload(body);
   const meetingId = firstText(payload.meetingId);
-  const result = await listQrSigninRecords(env, { payload: { meetingId, limit: qrNumberFromEnv(payload.limit, 500) } });
+  // 一定要把 env 轉傳下去，不然 listQrSigninRecords 內部找不到 env 會預設當 prod，
+  // 在 local-dev/dev 測試匯出時會查到 prod 的資料（甚至查不到自己剛建的測試資料）。
+  const appEnv = normalizeEnv(firstText(body.env, payload.env));
+  const result = await listQrSigninRecords(env, { payload: { meetingId, env: appEnv, limit: qrNumberFromEnv(payload.limit, 500) } });
   const rows = Array.isArray(result.records) ? result.records as Record<string, unknown>[] : [];
-  const header = ["姓名", "員工編號", "職級", "簽到時間", "狀態", "原因", "會議", "日期", "時間"];
-  const csvRows = rows.map((row) => [
-    row.name,
-    row.employeeId,
-    row.role,
-    row.signedAt,
-    row.status,
-    row.reason,
-    row.meeting,
-    row.date,
-    row.time
-  ].map(csvCell).join(","));
-  const csv = "\uFEFF" + [header.map(csvCell).join(","), ...csvRows].join("\r\n");
-  const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const header = ["姓名", "員工編號", "職級", "狀態", "簽到時間"];
+  const sheetRows = rows.map((row) => [
+    String(row.name || ""),
+    String(row.employeeId || ""),
+    String(row.role || ""),
+    qrCsvStatusLabel(row.status),
+    formatTaipeiDisplayDateTime(row.signedAt)
+  ]);
+  const base64 = bytesToBase64(buildMinimalXlsx(header, sheetRows));
+  const filename = await qrExportFilename(env, meetingId, "簽到原始檔案");
 
   return {
     ok: true,
     action: "exportQrSigninRecords",
     source: "skhps-backend-supabase",
-    filename: `qr-signin-records-${stamp}.csv`,
-    mimeType: "text/csv;charset=utf-8",
+    filename,
+    mimeType: XLSX_MIME_TYPE,
     count: rows.length,
-    csv,
-    data: { csv, rows }
+    base64,
+    data: { base64, rows }
+  };
+}
+
+/*
+ * 「另一個簽到上傳」格式：給外部系統上傳用，欄位固定是員工編號/身分證字號/姓名/
+ * 簽到時間/簽退時間/狀態。目前系統沒有蒐集身分證字號，這欄跟簽退時間一律留空；
+ * 狀態只分「出席」跟「未簽到」兩種，不分請假/未於時限內簽到這些細節。
+ */
+async function exportQrSigninAttendanceUpload(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const meetingId = firstText(payload.meetingId);
+  const appEnv = normalizeEnv(firstText(body.env, payload.env));
+  const result = await listQrSigninRecords(env, { payload: { meetingId, env: appEnv, limit: qrNumberFromEnv(payload.limit, 500) } });
+  const rows = Array.isArray(result.records) ? result.records as Record<string, unknown>[] : [];
+  const header = ["員工編號", "身分證字號", "姓名", "簽到時間", "簽退時間", "狀態"];
+  const sheetRows = rows.map((row) => [
+    String(row.employeeId || ""),
+    "",
+    String(row.name || ""),
+    formatTaipeiTimeOnly(row.signedAt),
+    "",
+    qrCsvAttendanceLabel(row.status)
+  ]);
+  const base64 = bytesToBase64(buildMinimalXlsx(header, sheetRows));
+  const filename = await qrExportFilename(env, meetingId, "簽到上傳");
+
+  return {
+    ok: true,
+    action: "exportQrSigninAttendanceUpload",
+    source: "skhps-backend-supabase",
+    filename,
+    mimeType: XLSX_MIME_TYPE,
+    count: rows.length,
+    base64,
+    data: { base64, rows }
   };
 }
 
@@ -4615,6 +4875,20 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
   if (action === "exportQrSigninRecords") {
     try {
       const result = await exportQrSigninRecords(env, body);
+      return json(result);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "exportQrSigninAttendanceUpload") {
+    try {
+      const result = await exportQrSigninAttendanceUpload(env, body);
       return json(result);
     } catch (error) {
       return json({
