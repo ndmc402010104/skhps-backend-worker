@@ -1605,8 +1605,11 @@ async function getLatestNewStaffByEmp(env: Env): Promise<Record<string, StaffMas
   for (const row of rows) {
     const emp = stringValue(row, ["員工編號", "emp", "employee_id"], "");
     const password = stringValue(row, ["密碼", "password", "Password", "PassWord"], "");
-    if (emp && password && !latestByEmp[emp]) {
-      latestByEmp[emp] = row;
+    // 員編大小寫視為同一個帳號：dedup key 一律轉大寫，不然 ABC123 / abc123
+    // 會被當成兩個帳號，各自維護自己的「最新一筆」，彼此不會互相覆蓋。
+    const empKey = emp.toUpperCase();
+    if (empKey && password && !latestByEmp[empKey]) {
+      latestByEmp[empKey] = row;
     }
   }
 
@@ -1686,13 +1689,15 @@ async function getQuickLoginStaff(env: Env, appEnv: AppEnvName) {
   const newStaffEmpList = Object.keys(latestNewStaffByEmp);
   let newStaffOverrideCount = 0;
 
+  // 員編大小寫視為同一個帳號，這裡的 key 跟 getLatestNewStaffByEmp() 的 dedup key
+  // 用同一套「一律轉大寫」規則，兩邊 key 才對得起來。
   for (const person of staffPeople) {
-    if (person.emp) staffByEmp.set(String(person.emp), person);
+    if (person.emp) staffByEmp.set(String(person.emp).toUpperCase(), person);
   }
 
   const staffList = staffPeople
     .map((person) => {
-      const newStaffRow = person.emp ? latestNewStaffByEmp[String(person.emp)] : null;
+      const newStaffRow = person.emp ? latestNewStaffByEmp[String(person.emp).toUpperCase()] : null;
       if (!newStaffRow) return person;
       newStaffOverrideCount += 1;
       return mergeNewStaffIntoQuickLoginPerson(person, newStaffRow, newStaffTableName);
@@ -1734,10 +1739,17 @@ async function findQuickLoginNewStaffRowsByEmpAndPassword(env: Env, emp: string,
   const tableName = getQuickLoginNewStaffTable();
   const empColumn = encodeURIComponent("員工編號");
   const passwordColumn = encodeURIComponent("密碼");
+  /*
+   * 員編大小寫視為同一個帳號：DB 欄位本身沒有 case-folded 的 unique index，
+   * 舊資料也可能已經存在大小寫不一致的重複列，用 eq. 精確比對會漏掉這些既有
+   * 資料。改用 ilike（不區分大小寫），並轉義 % / _ 這兩個 LIKE 萬用字元，
+   * 避免員編剛好含有這兩個字元時被誤判成 pattern。
+   */
+  const empPattern = emp.replace(/[%_]/g, (match) => "\\" + match);
 
   return await supabaseGet<StaffMasterRow[]>(
     env,
-    `${encodeURIComponent(tableName)}?${empColumn}=eq.${encodeURIComponent(emp)}&${passwordColumn}=eq.${encodeURIComponent(password)}&select=*`
+    `${encodeURIComponent(tableName)}?${empColumn}=ilike.${encodeURIComponent(empPattern)}&${passwordColumn}=eq.${encodeURIComponent(password)}&select=*`
   );
 }
 
@@ -1768,7 +1780,8 @@ function buildQuickLoginNewStaffRecord(emp: string, password: string, offsetSeco
 async function recordQuickLoginNewStaff(env: Env, body: any) {
   const payload = isPlainObject(body.payload) ? body.payload : body;
   const tableName = getQuickLoginNewStaffTable();
-  const emp = firstText(payload.emp, payload.account, payload.employeeId, payload.employee_id, payload["員工編號"]);
+  // 統一存成大寫，新資料才會慢慢收斂成同一種大小寫，減少未來還要靠 ilike 兜底的情況。
+  const emp = firstText(payload.emp, payload.account, payload.employeeId, payload.employee_id, payload["員工編號"]).toUpperCase();
   const password = firstText(payload.password, payload.PassWord, payload["密碼"]);
 
   if (!emp) {
