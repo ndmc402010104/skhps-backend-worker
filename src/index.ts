@@ -3273,13 +3273,27 @@ async function findQrSigninMeetingRow(env: Env, meetingId: string): Promise<QrSi
  * race condition。
  */
 async function findCurrentQrSigninRecord(env: Env, input: { meetingId: string; employeeId: string; name: string }): Promise<QrSigninRecordRow | null> {
-  let path = `${encodeURIComponent("QrSigninRecordCurrent")}?select=*&meeting_id=eq.${encodeURIComponent(input.meetingId)}&limit=1`;
+  const basePath = `${encodeURIComponent("QrSigninRecordCurrent")}?select=*&meeting_id=eq.${encodeURIComponent(input.meetingId)}&limit=1`;
+
   if (input.employeeId) {
-    path += `&employee_id=eq.${encodeURIComponent(input.employeeId)}`;
-  } else {
-    path += `&name=eq.${encodeURIComponent(input.name)}`;
+    const byEmpRows = await supabaseGet<QrSigninRecordRow[]>(
+      env,
+      `${basePath}&employee_id=eq.${encodeURIComponent(input.employeeId)}`
+    );
+    if (byEmpRows[0]) return byEmpRows[0];
+
+    // 員編比不到不能直接放棄——既有記錄本身的 employee_id 可能是空的
+    // （例如前台手動打字沒選名冊送出的舊資料），姓名其實對得上，一定要
+    // 退回比姓名，不然會漏判成「還沒簽到」而允許重複建立一筆新記錄。
+    if (!input.name) return null;
+    const byNameRows = await supabaseGet<QrSigninRecordRow[]>(
+      env,
+      `${basePath}&name=eq.${encodeURIComponent(input.name)}`
+    );
+    return byNameRows[0] || null;
   }
-  const rows = await supabaseGet<QrSigninRecordRow[]>(env, path);
+
+  const rows = await supabaseGet<QrSigninRecordRow[]>(env, `${basePath}&name=eq.${encodeURIComponent(input.name)}`);
   return rows[0] || null;
 }
 
