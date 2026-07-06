@@ -3227,7 +3227,10 @@ function qrSigninResultFromRecord(row: QrSigninRecordRow, meeting?: QrSigninMeet
     name: row.name,
     employeeId: row.employee_id || "",
     role: row.role || "",
-    signedAt: row.signed_at || row.submitted_at,
+    // 只有真的簽到/補登才能用 submitted_at 頂替顯示時間；其他狀態 signed_at
+    // 本來就該是空的，不能被 submitted_at（純粹是這筆記錄何時被送出/建立的
+    // 行政時間戳）頂替掉，不然畫面「未簽到」還是會看起來有簽到時間。
+    signedAt: (row.status === "signed" || row.status === "manual") ? (row.signed_at || row.submitted_at) : (row.signed_at || ""),
     submittedAt: row.submitted_at,
     frontendSubmittedAt: originalSubmittedAt,
     originalSubmittedAt,
