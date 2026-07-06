@@ -3720,7 +3720,16 @@ async function updateQrSigninRecord(env: Env, body: any) {
   if (!meeting) return { ok: false, action: "updateQrSigninRecord", error: "MEETING_NOT_FOUND", meetingId };
 
   const status = normalizeQrSigninAdminStatus(firstText(payload.status, payload.actionKey, payload.action));
-  const signedAt = normalizeQrSigninAdminSignedAt(firstText(payload.signedAt, payload.signed_at)) || new Date().toISOString();
+  const nowIso = new Date().toISOString();
+  /*
+   * 只有「已簽到／補登」代表真的有簽到這件事發生，缺值才補「現在」當預設；
+   * 請假／未簽到／未於時限內簽到／作廢都沒有真正的簽到時間，前端故意送空字串
+   * 就是要留空，不能在這裡又補一個「現在」蓋掉，不然畫面會出現「未簽到」卻有
+   * 簽到時間的矛盾資料。使用者自己在編輯表單填的時間一律照填（不管狀態是什麼）。
+   */
+  const providedSignedAt = normalizeQrSigninAdminSignedAt(firstText(payload.signedAt, payload.signed_at));
+  const impliesActualSignin = status === "signed" || status === "manual";
+  const signedAt = providedSignedAt || (impliesActualSignin ? nowIso : "");
   const name = firstText(payload.name, before && before.name);
   const employeeId = firstText(payload.employeeId, payload.employee_id, payload.empNo, before && before.employee_id);
   const role = firstText(payload.role, payload.rank, before && before.role);
@@ -3835,8 +3844,10 @@ async function updateQrSigninRecord(env: Env, body: any) {
   // 編輯表單的簽到時間欄位不管簽到狀態是什麼都可以改，之前只有 manual/signed
   // 兩種狀態才會把 signedAt 寫進 patch，導致其他狀態（outside_window/leave/absent…）
   // 編輯時間欄位存了也是白存，畫面看起來改了、重新整理又打回原本的值。
-  patch.signed_at = signedAt;
-  patch.submitted_at = before ? before.submitted_at : signedAt;
+  patch.signed_at = signedAt || null;
+  // submitted_at 是「這筆記錄何時被建立/送出」的行政時間戳，跟 signed_at（有沒有
+  // 真的簽到）是兩件事，不該被上面「非已簽到就留空」的邏輯連帶影響，一律用現在時間。
+  patch.submitted_at = before ? before.submitted_at : nowIso;
 
   let saved: QrSigninRecordRow;
   if (before) {
@@ -3857,7 +3868,7 @@ async function updateQrSigninRecord(env: Env, body: any) {
       app_id: "qr-signin",
       env: appEnv,
       staff_source: "StaffMaster",
-      submitted_at: signedAt,
+      submitted_at: nowIso,
       duplicate_of: null,
       client_request_id: firstText(payload.clientRequestId) || null,
       created_by: firstText(payload.createdBy, actorName, actorEmployeeId) || null,
