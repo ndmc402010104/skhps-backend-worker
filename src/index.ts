@@ -3134,9 +3134,9 @@ async function updateQrSigninMeetingPdfFields(env: Env, body: any) {
   const before = await findQrSigninMeetingRow(env, meetingId);
   if (!before) return { ok: false, action: "updateQrSigninMeetingPdfFields", error: "MEETING_NOT_FOUND", meetingId };
 
-  // hostName/recorderName 不進這個 JSON 了——主持人/紀錄的真正來源是
-  // QrSigninMeeting.selectionState（updateQrSigninMeetingSelection 那條路徑），
-  // 這裡再存一份文字快照只會製造出「兩個地方各存一份、彼此可能對不上」的舊 bug。
+  // hostName/recorderName 存的是「意圖」（希望是誰、但不一定已經真的指派
+  // 成功——那個人可能還沒簽到），不是目前真正的主持人/紀錄；真正的值一律是
+  // QrSigninMeeting.selectionState（updateQrSigninMeetingSelection 那條路徑）。
   const input = isPlainObject(payload.pdfFields) ? payload.pdfFields : {};
   const pdfFields = {
     departmentName: firstText(input.departmentName),
@@ -3145,6 +3145,8 @@ async function updateQrSigninMeetingPdfFields(env: Env, body: any) {
     meetingDate: firstText(input.meetingDate),
     timeStart: firstText(input.timeStart),
     timeEnd: firstText(input.timeEnd),
+    hostName: firstText(input.hostName),
+    recorderName: firstText(input.recorderName),
     meetingType: firstText(input.meetingType)
   };
 
@@ -4124,13 +4126,30 @@ async function deleteQrSigninRecord(env: Env, body: any) {
   const actorEmployeeId = firstText(payload.actorEmployeeId, payload.operatorEmployeeId);
 
   /*
-   * 真刪除：連同這筆記錄過去所有的稽核紀錄（audit trail，含最原始那一筆）一起砍掉。
+   * 真刪除：整條版本鏈（chain_id 相同的所有版本）一起砍掉，不是只刪
+   * recordId 這一筆。每次編輯都是 INSERT 新版本、supersedes_id 指回前一版
+   * （見 saveQrSigninRecordEdit 上面的說明），前端手上的 recordId 只要不是
+   * 這條鏈「目前生效版本」（例如重新整理前的舊快照、或編輯送出的回應還沒
+   * 更新到前端狀態），單刪這一筆就會直接撞
+   * QrSigninRecord_supersedes_id_fkey（因為還有更新的版本用 supersedes_id
+   * 指著它）。改成一次抓出整條鏈、用同一個 DELETE 陳述式整批刪掉——只要
+   * 鏈外沒有東西指著它們，同一批一起刪就不會有「被鏈內其他列擋住」的問題。
+   */
+  const chainId = before.chain_id || "";
+  const chainRows = chainId
+    ? await supabaseGet<QrSigninRecordRow[]>(env, `${encodeURIComponent(table)}?select=id&chain_id=eq.${encodeURIComponent(chainId)}`)
+    : [before];
+  const chainRecordIds = (Array.isArray(chainRows) && chainRows.length ? chainRows.map((row) => row.id) : [recordId]).filter(Boolean);
+  const chainIdFilter = chainRecordIds.map((id) => encodeURIComponent(id)).join(",");
+
+  /*
+   * 連同這條鏈過去所有的稽核紀錄（audit trail，含最原始那一筆）一起砍掉。
    * 跟「封存/作廢」（status=void，資料還在）是不同語意——這裡刪完之後這筆記錄的
    * 歷史完全不存在，之後如果要做「恢復原始資料」，是靠 audit trail 保留原始 before_data，
    * 所以這個 delete 動作本身也要留一筆自己的稽核紀錄（存在另一張表／或直接記 log），
    * 避免砍掉之後完全查不到「誰在什麼時候刪除了這筆」。
    */
-  await supabaseDelete<unknown[]>(env, auditTable, `record_id=eq.${encodeURIComponent(recordId)}`).catch(() => []);
+  await supabaseDelete<unknown[]>(env, auditTable, `record_id=in.(${chainIdFilter})`).catch(() => []);
 
   // record_id 是 FK（on delete set null），一定要在刪記錄「之前」寫入，
   // 不然記錄一旦被刪掉，這筆稽核紀錄的 record_id 會直接違反外鍵限制而寫入失敗。
@@ -4144,11 +4163,13 @@ async function deleteQrSigninRecord(env: Env, body: any) {
     actor_employee_id: actorEmployeeId || null,
     note: firstText(payload.note) || null,
     before_data: before,
-    after_data: {},
-    metadata: { source: "qr-signin-backend", hardDelete: true }
+    after_data: { deletedChainRecordIds: chainRecordIds },
+    metadata: { source: "qr-signin-backend", hardDelete: true, chainId: chainId || null }
   });
 
-  const deleted = await supabaseDelete<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(recordId)}`);
+  const deleted = chainId
+    ? await supabaseDelete<QrSigninRecordRow[]>(env, table, `chain_id=eq.${encodeURIComponent(chainId)}`)
+    : await supabaseDelete<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(recordId)}`);
 
   return {
     ok: true,
@@ -4156,6 +4177,7 @@ async function deleteQrSigninRecord(env: Env, body: any) {
     source: "skhps-backend-supabase",
     table,
     recordId,
+    deletedChainRecordIds: chainRecordIds,
     deletedCount: Array.isArray(deleted) ? deleted.length : 0
   };
 }
