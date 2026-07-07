@@ -39,6 +39,7 @@ export interface Env {
   SUPABASE_EXTERNAL_PROJECT_TABLE?: string;
   SUPABASE_CSS_REGISTRY_RUNTIME_VIEW?: string;
   MAX_FILE_SIZE_BYTES?: string;
+  APP_DEFAULT_TABLE?: string;
 
   QR_SIGNIN_MEETING_TABLE?: string;
   QR_SIGNIN_RECORD_TABLE?: string;
@@ -123,6 +124,7 @@ const DEFAULT_STAFF_TABLE = "StaffMaster";
 const DEFAULT_QUICK_LOGIN_NEW_STAFF_TABLE = "NewStaff";
 const DEFAULT_EXTERNAL_PROJECT_TABLE = "ExternalProject";
 const DEFAULT_CSS_REGISTRY_RUNTIME_VIEW = "CssRegistryRuntimeRow";
+const DEFAULT_APP_DEFAULT_TABLE = "Default";
 const DEFAULT_QR_SIGNIN_MEETING_TABLE = "QrSigninMeeting";
 const DEFAULT_QR_SIGNIN_RECORD_TABLE = "QrSigninRecord";
 const DEFAULT_QR_SIGNIN_AUDIT_TABLE = "QrSigninRecordAudit";
@@ -3064,6 +3066,105 @@ async function updateQrSigninMeetingSelection(env: Env, body: any) {
   };
 }
 
+/*
+ * 簽到單 PDF 的「會議資訊」欄位（科別/主題/地點/日期/時間/主持人/紀錄/會議性質）
+ * 存進 QrSigninMeeting 既有的 metadata JSONB 欄位裡（metadata.pdfFields），
+ * 不新增資料表、不新增正式欄位——照 [[project_qr_signin_pdf_header_fields_editable_todo]]
+ * 那份筆記原本規劃的方向做。這裡刻意跟「主題/日期/時間/主持人/紀錄」這些
+ * 行事曆同步用的既有欄位（title/meeting_date/starts_at/ends_at/host_record_id/
+ * recorder_record_id）分開存，不寫回那些欄位——避免下次行事曆同步時被覆蓋掉，
+ * 也避免這次「會議資訊」編輯不小心動到行事曆同步的資料來源。
+ */
+function getAppDefaultTable(env: Env): string {
+  return String(env.APP_DEFAULT_TABLE || DEFAULT_APP_DEFAULT_TABLE).trim() || DEFAULT_APP_DEFAULT_TABLE;
+}
+
+/*
+ * 通用「預設值」key-value 表：用 scope 區分不同畫面/App（例如 qrSignin），
+ * 不綁死單一業務。只存目前值，改掉就覆蓋，不做歷史紀錄。
+ */
+async function getAppDefaults(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const table = getAppDefaultTable(env);
+  const scope = firstText(payload.scope);
+  if (!scope) return { ok: false, action: "getAppDefaults", error: "MISSING_SCOPE" };
+
+  const rows = await supabaseGet<Array<{ key: string; value: string }>>(
+    env,
+    `${table}?select=key,value&scope=eq.${encodeURIComponent(scope)}`
+  );
+
+  const defaults: Record<string, string> = {};
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    defaults[row.key] = row.value || "";
+  });
+
+  return { ok: true, action: "getAppDefaults", source: "skhps-backend-supabase", table, scope, defaults };
+}
+
+async function saveAppDefaults(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const table = getAppDefaultTable(env);
+  const scope = firstText(payload.scope);
+  if (!scope) return { ok: false, action: "saveAppDefaults", error: "MISSING_SCOPE" };
+
+  const input = isPlainObject(payload.defaults) ? payload.defaults : {};
+  const records = Object.keys(input).map((key) => ({
+    scope,
+    key,
+    value: firstText(input[key])
+  }));
+
+  if (!records.length) return { ok: false, action: "saveAppDefaults", error: "MISSING_DEFAULTS" };
+
+  await supabaseUpsert(env, table, records, "scope,key");
+
+  const defaults: Record<string, string> = {};
+  records.forEach((record) => { defaults[record.key] = record.value; });
+
+  return { ok: true, action: "saveAppDefaults", source: "skhps-backend-supabase", table, scope, defaults };
+}
+
+async function updateQrSigninMeetingPdfFields(env: Env, body: any) {
+  const payload = normalizeRegistryPayload(body);
+  const table = getQrSigninMeetingTable(env);
+  const meetingId = firstText(payload.meetingId, payload.id);
+  if (!meetingId) return { ok: false, action: "updateQrSigninMeetingPdfFields", error: "MISSING_MEETING_ID" };
+
+  const before = await findQrSigninMeetingRow(env, meetingId);
+  if (!before) return { ok: false, action: "updateQrSigninMeetingPdfFields", error: "MEETING_NOT_FOUND", meetingId };
+
+  // hostName/recorderName 不進這個 JSON 了——主持人/紀錄的真正來源是
+  // QrSigninMeeting.selectionState（updateQrSigninMeetingSelection 那條路徑），
+  // 這裡再存一份文字快照只會製造出「兩個地方各存一份、彼此可能對不上」的舊 bug。
+  const input = isPlainObject(payload.pdfFields) ? payload.pdfFields : {};
+  const pdfFields = {
+    departmentName: firstText(input.departmentName),
+    topic: firstText(input.topic),
+    location: firstText(input.location),
+    meetingDate: firstText(input.meetingDate),
+    timeStart: firstText(input.timeStart),
+    timeEnd: firstText(input.timeEnd),
+    meetingType: firstText(input.meetingType)
+  };
+
+  const existingMetadata = isPlainObject(before.metadata) ? before.metadata : {};
+  const nextMetadata = { ...existingMetadata, pdfFields };
+
+  const updated = await supabasePatch<QrSigninMeetingRow[]>(env, table, `id=eq.${encodeURIComponent(meetingId)}`, { metadata: nextMetadata });
+  const saved = Array.isArray(updated) && updated[0] ? updated[0] : { ...before, metadata: nextMetadata } as QrSigninMeetingRow;
+
+  return {
+    ok: true,
+    action: "updateQrSigninMeetingPdfFields",
+    source: "skhps-backend-supabase",
+    table,
+    meetingId,
+    pdfFields,
+    meeting: qrSigninMeetingDisplay(saved)
+  };
+}
+
 function normalizeQrSigninSubmitPayload(body: any): Record<string, unknown> {
   const payload = body && body.payload && typeof body.payload === "object" ? body.payload : body || {};
   return payload as Record<string, unknown>;
@@ -4782,6 +4883,33 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
   if (action === "updateQrSigninMeetingSelection") {
     try {
       const result = await updateQrSigninMeetingSelection(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({ ok: false, action, source: "skhps-backend", error: error instanceof Error ? error.message : String(error) }, 500);
+    }
+  }
+
+  if (action === "updateQrSigninMeetingPdfFields") {
+    try {
+      const result = await updateQrSigninMeetingPdfFields(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({ ok: false, action, source: "skhps-backend", error: error instanceof Error ? error.message : String(error) }, 500);
+    }
+  }
+
+  if (action === "getAppDefaults") {
+    try {
+      const result = await getAppDefaults(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({ ok: false, action, source: "skhps-backend", error: error instanceof Error ? error.message : String(error) }, 500);
+    }
+  }
+
+  if (action === "saveAppDefaults") {
+    try {
+      const result = await saveAppDefaults(env, body);
       return json(result, result.ok === false ? 400 : 200);
     } catch (error) {
       return json({ ok: false, action, source: "skhps-backend", error: error instanceof Error ? error.message : String(error) }, 500);
