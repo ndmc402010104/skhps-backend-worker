@@ -4171,6 +4171,32 @@ async function deleteQrSigninRecord(env: Env, body: any) {
     ? await supabaseDelete<QrSigninRecordRow[]>(env, table, `chain_id=eq.${encodeURIComponent(chainId)}`)
     : await supabaseDelete<QrSigninRecordRow[]>(env, table, `id=eq.${encodeURIComponent(recordId)}`);
 
+  /*
+   * 這個人如果剛好是這場會議目前的主持人/紀錄者，整條鏈砍掉之後
+   * QrSigninMeeting.host_record_id/recorder_record_id 會變成指著一筆已經
+   * 不存在的記錄——這是一個「懸空指標」：畫面上主持人框看起來是空的（候選
+   * 名單裡已經沒有這個人可以比對），但 liveSingleSelectId() 讀到的還是這個
+   * 已刪除的舊 id（非空字串），導致「輸入預設值」的空值判斷誤判成「還有人
+   * 被指派」而不肯套用預設值，只有整頁重新整理、選會議清單重新抓一次
+   * meeting 才會撞見這個不存在的 id 進而正確清空。這裡砍記錄的同時，只要
+   * 這個人是這條鏈的一員就直接把 meeting 對應欄位一起清掉，不留懸空指標。
+   */
+  let meetingAfterDelete: QrSigninMeetingRow | null = await findQrSigninMeetingRow(env, before.meeting_id).catch(() => null);
+  if (meetingAfterDelete) {
+    const meetingTable = getQrSigninMeetingTable(env);
+    const meetingPatch: Record<string, unknown> = {};
+    if (meetingAfterDelete.host_record_id && chainRecordIds.indexOf(meetingAfterDelete.host_record_id) >= 0) {
+      meetingPatch.host_record_id = null;
+    }
+    if (meetingAfterDelete.recorder_record_id && chainRecordIds.indexOf(meetingAfterDelete.recorder_record_id) >= 0) {
+      meetingPatch.recorder_record_id = null;
+    }
+    if (Object.keys(meetingPatch).length) {
+      const updatedMeetings = await supabasePatch<QrSigninMeetingRow[]>(env, meetingTable, `id=eq.${encodeURIComponent(meetingAfterDelete.id)}`, meetingPatch).catch(() => []);
+      meetingAfterDelete = Array.isArray(updatedMeetings) && updatedMeetings[0] ? updatedMeetings[0] : { ...meetingAfterDelete, ...meetingPatch } as QrSigninMeetingRow;
+    }
+  }
+
   return {
     ok: true,
     action: "deleteQrSigninRecord",
@@ -4178,7 +4204,8 @@ async function deleteQrSigninRecord(env: Env, body: any) {
     table,
     recordId,
     deletedChainRecordIds: chainRecordIds,
-    deletedCount: Array.isArray(deleted) ? deleted.length : 0
+    deletedCount: Array.isArray(deleted) ? deleted.length : 0,
+    meeting: meetingAfterDelete ? qrSigninMeetingDisplay(meetingAfterDelete) : null
   };
 }
 
