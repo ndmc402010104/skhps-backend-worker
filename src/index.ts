@@ -3969,6 +3969,21 @@ async function updateQrSigninRecord(env: Env, body: any) {
   patch.submitted_at = before ? before.submitted_at : nowIso;
 
   let saved: QrSigninRecordRow;
+  /*
+   * createQrSigninRecordVersion() 內建「若前一版剛好是主持人/紀錄者，
+   * host_record_id/recorder_record_id 自動跟著新版本走」的邏輯，DB 寫入
+   * 當下就是對的。但這裡組回應／effectiveMeeting 用的如果還是函式最上面
+   * 抓的那份「編輯前」meeting 快照，就會回傳過期資料：這次請求明明沒去動
+   * 主持人（touchesHost/touchesRecorder 都是 false，因為前端沒送
+   * selectionState），使用者卻會看到「儲存後主持人消失」——DB 早就正確
+   * 指到新版本，只是這次 API 回應沒反映，重新整理（重新抓 DB）就會恢復
+   * 正常（2026-07-09 使用者回報：編輯已經是主持人的既有列，存檔當下畫面
+   * 顯示沒有主持人，重新整理後兩邊又都對）。改成用 versioned.meeting
+   * （createQrSigninRecordVersion 已經處理過自動接續的最新 meeting）當
+   * effectiveMeeting 的起點，下面「這次編輯也明確切換主持人/紀錄者」的
+   * PATCH 才疊加上去。
+   */
+  let effectiveMeeting = meeting;
   if (before) {
     const versioned = await createQrSigninRecordVersion(env, before, patch, adminAction, {
       actorName,
@@ -3976,6 +3991,7 @@ async function updateQrSigninRecord(env: Env, body: any) {
       note: firstText(payload.note)
     });
     saved = versioned.saved;
+    effectiveMeeting = versioned.meeting || meeting;
   } else {
     // 全新的人（後台手動新增，沒有既有記錄可版本化）：一律沒有 QR 基準。
     // chain_id 是 NOT NULL，必須在 INSERT 當下就給值（同 submitQrSignin 的新人分支），
@@ -4010,15 +4026,15 @@ async function updateQrSigninRecord(env: Env, body: any) {
     });
   }
 
-  // 把編輯當下合併進來的主持人/紀錄者切換，套用在「這一次」剛建立的版本上（見上方大註解）。
-  let effectiveMeeting = meeting;
+  // 把編輯當下合併進來的主持人/紀錄者切換，疊加在 effectiveMeeting（已經含
+  // createQrSigninRecordVersion 自動接續的結果）之上（見上方大註解）。
   if (before && (touchesHost || touchesRecorder)) {
     const meetingPatch: Record<string, unknown> = {};
     if (touchesHost) meetingPatch.host_record_id = becomesHost ? saved.id : null;
     if (touchesRecorder) meetingPatch.recorder_record_id = becomesRecorder ? saved.id : null;
     const meetingTable = getQrSigninMeetingTable(env);
     const updatedMeetings = await supabasePatch<QrSigninMeetingRow[]>(env, meetingTable, `id=eq.${encodeURIComponent(meetingId)}`, meetingPatch);
-    effectiveMeeting = Array.isArray(updatedMeetings) && updatedMeetings[0] ? updatedMeetings[0] : { ...meeting, ...meetingPatch } as QrSigninMeetingRow;
+    effectiveMeeting = Array.isArray(updatedMeetings) && updatedMeetings[0] ? updatedMeetings[0] : { ...effectiveMeeting, ...meetingPatch } as QrSigninMeetingRow;
   }
 
   const original = saved.qr_origin_id ? await findQrSigninRecordById(env, saved.qr_origin_id).catch(() => null) : null;
