@@ -3910,8 +3910,23 @@ async function updateQrSigninRecord(env: Env, body: any) {
   const requestedRecorderRecordId = clearedSelectionKeys.has("recorder") ? "" : firstText(selectionPayload.singleSelects.recorder);
   const touchesHost = clearedSelectionKeys.has("host") || Boolean(requestedHostRecordId);
   const touchesRecorder = clearedSelectionKeys.has("recorder") || Boolean(requestedRecorderRecordId);
-  const becomesHost = touchesHost && before && requestedHostRecordId === before.id;
-  const becomesRecorder = touchesRecorder && before && requestedRecorderRecordId === before.id;
+  /*
+   * before 存在（編輯既有記錄）時，前端送來的 id 是這筆記錄「當下真正的」
+   * resultId，一定要嚴格比對 === before.id 才算「指定的是自己」。
+   * before 不存在（新增人員、INSERT 分支）時，前端送來的 id 其實是水庫
+   * swipe-table.js 幫transient列產生的本機暫時 id（"row-<timestamp>"），
+   * 存檔當下這筆記錄根本還沒有真正的 resultId，前端不可能預先知道、也就
+   * 不可能送出真正比對得上的 id——但 UI 機制（checkHostRecorderNameMatch
+   * 打姓名自動勾選 / 編輯列自己的單選圈）保證這個圈圈只會勾在「正在新增
+   * 的這一列自己」，不會是別列，所以只要不是「清空」，touchesHost 為真
+   * 就等同「這筆新記錄要成為主持人」，不需要（也無法）比對 id。
+   * 沒有這段，新增人員時勾選主持人會在存檔當下悄悄整個沒作用（DB 沒寫入
+   * host_record_id），要等下一次重新整理讓 resolveHostRecorderIntent()
+   * 用真正的 id 重新指派一次才會生效（2026-07-09 使用者回報：新增人員
+   * 打姓名時主持人打勾有顯示，儲存後卻不見了，重新整理才出現）。
+   */
+  const becomesHost = touchesHost && (before ? requestedHostRecordId === before.id : !clearedSelectionKeys.has("host"));
+  const becomesRecorder = touchesRecorder && (before ? requestedRecorderRecordId === before.id : !clearedSelectionKeys.has("recorder"));
 
   // 根據新邏輯判斷 source：比對新內容是否與 QR 原始基準（qr_origin_id 指向的那筆）相同
   let computedSource = before ? before.source : "admin";  // 預設用現在的 source
@@ -4027,8 +4042,11 @@ async function updateQrSigninRecord(env: Env, body: any) {
   }
 
   // 把編輯當下合併進來的主持人/紀錄者切換，疊加在 effectiveMeeting（已經含
-  // createQrSigninRecordVersion 自動接續的結果）之上（見上方大註解）。
-  if (before && (touchesHost || touchesRecorder)) {
+  // createQrSigninRecordVersion 自動接續的結果）之上（見上方大註解）。這裡
+  // 故意不再限定 before 存在——新增人員（!before）一樣可能在同一次請求裡
+  // 帶著 becomesHost/becomesRecorder（見上面 becomesHost 大註解），一樣要
+  // 套用到剛 INSERT 出來的 saved.id。
+  if (touchesHost || touchesRecorder) {
     const meetingPatch: Record<string, unknown> = {};
     if (touchesHost) meetingPatch.host_record_id = becomesHost ? saved.id : null;
     if (touchesRecorder) meetingPatch.recorder_record_id = becomesRecorder ? saved.id : null;
