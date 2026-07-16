@@ -1676,17 +1676,24 @@ async function getQuickLoginStaff(env: Env, appEnv: AppEnvName) {
   /* StaffMaster 也不從 KV 回傳；保留 appEnv 只作診斷。 */
   void appEnv;
 
-  const rows = await supabaseGet<StaffMasterRow[]>(
-    env,
-    `${encodeURIComponent(tableName)}?select=*`
-  );
   let latestNewStaffByEmp: Record<string, StaffMasterRow> = {};
   let newStaffError = "";
 
-  try {
-    latestNewStaffByEmp = await getLatestNewStaffByEmp(env);
-  } catch (error) {
-    newStaffError = error instanceof Error ? error.message : String(error);
+  // 2026-07-17（加速）：StaffMaster 與 NewStaff 兩個查詢互相獨立，原本是
+  // 序列 await（撈完 StaffMaster 才撈 NewStaff），改成 Promise.all 並行，
+  // 省掉一個查詢的往返（實測 quick-login-staff task ~2s 主要就是這兩個序列
+  // Supabase 查詢）。NewStaff 失敗不影響主名單，catch 後留空覆蓋（行為不變）。
+  const [rows, newStaffResult] = await Promise.all([
+    supabaseGet<StaffMasterRow[]>(env, `${encodeURIComponent(tableName)}?select=*`),
+    getLatestNewStaffByEmp(env).then(
+      (value) => ({ ok: true as const, value }),
+      (error) => ({ ok: false as const, error: error instanceof Error ? error.message : String(error) })
+    )
+  ]);
+  if (newStaffResult.ok) {
+    latestNewStaffByEmp = newStaffResult.value;
+  } else {
+    newStaffError = newStaffResult.error;
   }
 
   const staffPeople = rows.map((row) => toQuickLoginPerson(row, tableName));
