@@ -243,9 +243,12 @@ function normalizeCssRegistryKeys(input: unknown): string[] {
   return keys.length ? keys : ["cssMain"];
 }
 
+// 2026-07-17（加速）：原本 `...row` 把 Supabase 每一欄都攤開送給前端，導致
+// 每筆 row 夾帶一堆「套 CSS 用不到」的欄位（source、三份時間戳、sheet_key/
+// __order/sort_order 重複…）。實測前端 css-sheet-runtime 組 CSS 只讀下面這 9
+// 個欄位，其餘全砍——單筆 ~478b → ~230b。若之後有欄位真的要用，回來這裡加。
 function normalizeCssRegistryRuntimeRow(row: Record<string, unknown>, index: number): Record<string, unknown> {
   return {
-    ...row,
     sheetKey: firstText(row.sheetKey, row.sheet_key, "cssMain"),
     component: firstText(row.component),
     selector: firstText(row.selector, row.className, row.class_name),
@@ -294,10 +297,10 @@ async function getCssRegistryRuntime(env: Env, body: any, action: string): Promi
     registryKeys,
     sheetKeys: registryKeys,
     count: normalizedRows.length,
-    rows: normalizedRows,
-    data: {
-      rows: normalizedRows
-    }
+    rows: normalizedRows
+    // 2026-07-17（加速）：移除 `data: { rows: normalizedRows }`——那是 rows 的
+    // 原封重複（2.15MB），前端 normalizeBackendRows 只讀 response.rows、從沒讀
+    // 過 data，純浪費。若未來有 client 依賴 data.rows 再回來加回。
   };
 }
 
