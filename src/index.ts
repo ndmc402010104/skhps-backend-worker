@@ -2646,6 +2646,25 @@ async function countQrSigninRecordsByMeeting(env: Env, meetingId: string, appEnv
   return parseInt(String(countHeader || "0"), 10);
 }
 
+// 2026-07-17（加速）：取代「每場會議各發一個 count 查詢」的 N+1（會議多時
+// 是幾十~上百個並行 Supabase 查詢，實測 getQrSigninMeetings ~5.9s）。改成
+// 一個查詢撈出這個 env 底下所有「有效簽到記錄」的 meeting_id（只取 meeting_id
+// 欄、分頁），在 worker 端 group 計數。語意跟 countQrSigninRecordsByMeeting
+// 完全一致（同一張 QrSigninRecord 表、同一個 status not-in(void,duplicate,error)
+// 篩選＋env 篩選），只是把 N 次往返併成一次。
+async function countQrSigninRecordsByMeetings(env: Env, appEnv: AppEnvName): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  const table = getQrSigninRecordTable(env);
+  const path = `${encodeURIComponent(table)}?select=meeting_id&status=not.in.(void,duplicate,error)&env=eq.${encodeURIComponent(appEnv)}`;
+  const rows = await supabaseGetAllRows(env, path);
+  for (const row of rows) {
+    const id = String((row as { meeting_id?: unknown }).meeting_id || "");
+    if (!id) continue;
+    counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  return counts;
+}
+
 async function findQrSigninMeetingBySource(env: Env, row: Record<string, unknown>): Promise<QrSigninMeetingRow | null> {
   const table = getQrSigninMeetingTable(env);
   const envName = firstText(row.env);
@@ -2761,15 +2780,17 @@ async function getQrSigninMeetings(env: Env, body: any) {
     }
   }
 
-  // 並行查詢每個會議的簽到記錄數
-  const meetingsWithCounts = await Promise.all(rows.map(async (row) => {
+  // 2026-07-17（加速）：原本對每場會議各發一個 count 查詢（N+1，會議多就是
+  // 幾十~上百個並行 Supabase 查詢 → ~5.9s）。改成一次撈全部再 worker 端 group
+  // 計數（見 countQrSigninRecordsByMeetings），數字語意完全不變。
+  const countByMeeting = await countQrSigninRecordsByMeetings(env, appEnv).catch(() => new Map<string, number>());
+  const meetingsWithCounts = rows.map((row) => {
     const display = qrSigninMeetingDisplay(row);
-    const signinCount = await countQrSigninRecordsByMeeting(env, row.id, appEnv).catch(() => 0);
     return {
       ...display,
-      signinRecordCount: signinCount
+      signinRecordCount: countByMeeting.get(String(row.id)) || 0
     };
-  }));
+  });
 
   return {
     ok: true,
