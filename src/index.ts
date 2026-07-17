@@ -41,6 +41,10 @@ export interface Env {
   MAX_FILE_SIZE_BYTES?: string;
   APP_DEFAULT_TABLE?: string;
 
+  // 2026-07-17：wrangler.toml 早就綁了這個 KV，但一直沒被用；拿來做
+  // 日曆/會議這種「全 env 共用、變動不頻繁」的邊緣快取。
+  SKHPS_CACHE?: KVNamespace;
+
   QR_SIGNIN_MEETING_TABLE?: string;
   QR_SIGNIN_RECORD_TABLE?: string;
   QR_SIGNIN_AUDIT_TABLE?: string;
@@ -2825,6 +2829,28 @@ async function getQrSigninMeetings(env: Env, body: any) {
 async function previewQrSigninCalendarMeetings(env: Env, body: any) {
   const payload = normalizeRegistryPayload(body);
   const appEnv = normalizeEnv(firstText(body.env, payload.env));
+  // 2026-07-17：lookbackDays 參數化。**預設 0（＝原本後台「只預覽未來」的行為
+  // 不變）**；前台若傳 lookbackDays（例如 45）就能拿到過去+未來的完整窗口。
+  // lookaheadDays 沿用原本的 env 預設（45）。
+  const lookbackDays = qrNumberFromEnv(payload.lookbackDays, 0);
+  const lookaheadDays = qrNumberFromEnv(payload.lookaheadDays, qrNumberFromEnv(env.QR_SIGNIN_CALENDAR_LOOKAHEAD_DAYS, DEFAULT_QR_SIGNIN_LOOKAHEAD_DAYS));
+
+  // 2026-07-17（加速）：日曆讀取（ICS/AppsScript）是這支最慢的部分。加 KV
+  // 邊緣快取——全 env 共用、日曆變動不頻繁，快取 120 秒；不同窗口分開 key。
+  // 傳 forceRefresh/noCache 可略過。
+  const cacheKey = `qr-cal-preview:${appEnv}:${lookbackDays}:${lookaheadDays}`;
+  const bypassCache = booleanFromUnknown(payload.forceRefresh) || booleanFromUnknown(payload.noCache);
+  if (!bypassCache && env.SKHPS_CACHE) {
+    try {
+      const cached = await env.SKHPS_CACHE.get(cacheKey);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        parsed.cache = "hit";
+        return parsed;
+      }
+    } catch { /* 快取讀失敗就當 miss，繼續正常讀 */ }
+  }
+
   let rows: Record<string, unknown>[] = [];
   let source = "";
   let syncError = "";
@@ -2835,16 +2861,16 @@ async function previewQrSigninCalendarMeetings(env: Env, body: any) {
     const response = await fetch(icsUrl, { method: "GET" });
     const text = await response.text();
     if (!response.ok) throw new Error(`QR_SIGNIN_ICS_FETCH_FAILED ${response.status} ${text.slice(0, 200)}`);
-    rows = parseQrSigninIcsRows(text, env, { ...payload, env: appEnv, lookbackDays: 0 });
+    rows = parseQrSigninIcsRows(text, env, { ...payload, env: appEnv, lookbackDays, lookaheadDays });
     source = "google-calendar-ics";
   } catch (icsError) {
     try {
       const fallback = await callQrSigninAppsScriptFallback(env, "getQrSigninMeetings", { ...payload, env: appEnv }) as any;
       const data = fallback && fallback.data ? fallback.data : fallback;
       const meetings = data && Array.isArray(data.meetings) ? data.meetings : [];
-      const lookaheadDays = qrNumberFromEnv(payload.lookaheadDays, qrNumberFromEnv(env.QR_SIGNIN_CALENDAR_LOOKAHEAD_DAYS, DEFAULT_QR_SIGNIN_LOOKAHEAD_DAYS));
       const nowMs = Date.now();
       const lookaheadLimitMs = nowMs + lookaheadDays * 86400000;
+      const lookbackLimitMs = nowMs - lookbackDays * 86400000;
       rows = meetings
         .map((meeting: any) => toQrSigninMeetingRowFromLegacy({
           envName: appEnv,
@@ -2854,12 +2880,11 @@ async function previewQrSigninCalendarMeetings(env: Env, body: any) {
           sourceId: firstText(meeting.calendarEventId, meeting.sourceId, meeting.id, meeting.eventId, meeting.uid),
           metadata: { rawSource: "apps-script", rawMeeting: meeting }
         }))
-        // Apps Script 的舊端點沒有日期窗口概念，回傳的是全部歷史場次；這裡跟 ICS
-        // 那條路徑一樣，只留「現在到 lookaheadDays 天內」的未來場次，避免這個純預覽
-        // 用途的清單混進一堆過去、從沒人簽到過的舊會議。
+        // Apps Script 舊端點回傳全部歷史場次；跟 ICS 路徑一致，用 lookback~lookahead
+        // 窗口過濾（預設 lookback=0 就等於原本「只留未來場次」的行為）。
         .filter((row: Record<string, unknown>) => {
           const startsAt = row.starts_at ? Date.parse(String(row.starts_at)) : NaN;
-          return Number.isFinite(startsAt) && startsAt >= nowMs && startsAt <= lookaheadLimitMs;
+          return Number.isFinite(startsAt) && startsAt >= lookbackLimitMs && startsAt <= lookaheadLimitMs;
         });
       source = "apps-script-calendar";
       syncError = icsError instanceof Error ? icsError.message : String(icsError);
@@ -2870,14 +2895,24 @@ async function previewQrSigninCalendarMeetings(env: Env, body: any) {
 
   const meetings = rows.map((row) => qrSigninCalendarPreviewDisplay(row));
 
-  return {
+  const result = {
     ok: true,
     action: "previewQrSigninCalendarMeetings",
     source,
     count: meetings.length,
     data: { ok: true, meetings, source, syncError },
-    meetings
+    meetings,
+    cache: "miss"
   };
+
+  // 只快取成功的 ICS 讀取（fallback/錯誤不快取，免得把壞結果卡住 120 秒）。
+  if (env.SKHPS_CACHE && source === "google-calendar-ics" && meetings.length > 0) {
+    try {
+      await env.SKHPS_CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 120 });
+    } catch { /* 快取寫失敗不影響回應 */ }
+  }
+
+  return result;
 }
 
 function qrSigninCalendarPreviewDisplay(row: Record<string, unknown>): Record<string, unknown> {
