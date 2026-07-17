@@ -1,6 +1,6 @@
 /*
  * 檔案位置：skhps-backend-worker/src/index.ts
- * 時間戳記：2026-07-02 11:25 UTC+8
+ * 時間戳記：2026-07-12 12:08 UTC+8
  * 用途：SKHPS 新後端 Cloudflare Worker。
  *
  * 目前提供：
@@ -14,6 +14,7 @@
  *   - getCssRegistryRuntime / getCssSheetRuntime（相容舊 action，實際讀 Supabase CssRegistryRuntimeRow）
  *   - saveCssSheetRows（CSS Setting Studio 存檔，寫回 Supabase CssRegistryRule，layer 固定 override / env 固定 global；Google Sheet 已 retire，不再 dual-write）
  *   - deleteCssRegistryRows（精準刪除 Supabase CssRegistryRule 測試/維護列）
+ *   - getCssRegistryPackages / saveCssRegistryPackage（dev-only 版本化 CSS package；簡單 token 仍沿用 CssRegistryRule）
  *   - getQuickLoginStaff（讀 Supabase 共用人員主檔 StaffMaster，並以 NewStaff 最新新增時間覆蓋既有員編密碼）
  *   - recordQuickLoginNewStaff（記錄 quick-login wrapper LOGIN 帳密；不作為顯示名單來源）
  *   - listStaffMaster / upsertStaffMaster / updateStaffMasterStatus / reorderStaffMaster（StaffMaster 管理）
@@ -38,6 +39,7 @@ export interface Env {
   SUPABASE_STAFF_TABLE?: string;
   SUPABASE_EXTERNAL_PROJECT_TABLE?: string;
   SUPABASE_CSS_REGISTRY_RUNTIME_VIEW?: string;
+  SUPABASE_CSS_REGISTRY_RULE_TABLE?: string;
   MAX_FILE_SIZE_BYTES?: string;
   APP_DEFAULT_TABLE?: string;
 
@@ -128,6 +130,9 @@ const DEFAULT_STAFF_TABLE = "StaffMaster";
 const DEFAULT_QUICK_LOGIN_NEW_STAFF_TABLE = "NewStaff";
 const DEFAULT_EXTERNAL_PROJECT_TABLE = "ExternalProject";
 const DEFAULT_CSS_REGISTRY_RUNTIME_VIEW = "CssRegistryRuntimeRow";
+const DEFAULT_CSS_REGISTRY_RULE_TABLE = "CssRegistryRule";
+const DEFAULT_CSS_REGISTRY_PACKAGE_TABLE = "CssRegistryPackage";
+const DEFAULT_CSS_REGISTRY_PACKAGE_REVISION_TABLE = "CssRegistryPackageRevision";
 const DEFAULT_APP_DEFAULT_TABLE = "Default";
 const DEFAULT_QR_SIGNIN_MEETING_TABLE = "QrSigninMeeting";
 const DEFAULT_QR_SIGNIN_RECORD_TABLE = "QrSigninRecord";
@@ -265,6 +270,165 @@ function normalizeCssRegistryRuntimeRow(row: Record<string, unknown>, index: num
   };
 }
 
+function getCssRegistryRuleTable(env: Env): string {
+  return String(env.SUPABASE_CSS_REGISTRY_RULE_TABLE || DEFAULT_CSS_REGISTRY_RULE_TABLE).trim() || DEFAULT_CSS_REGISTRY_RULE_TABLE;
+}
+
+function normalizeCssPackageRow(row: Record<string, unknown>, index: number): Record<string, unknown> {
+  return {
+    env: firstText(row.env),
+    packageKey: firstText(row.packageKey, row.package_key),
+    displayName: firstText(row.displayName, row.display_name),
+    version: firstText(row.version),
+    manifest: row.manifest && typeof row.manifest === "object" ? row.manifest : {},
+    cssText: firstText(row.cssText, row.css_text),
+    enabled: row.enabled !== false,
+    sortOrder: Number(row.sortOrder ?? row.sort_order ?? index),
+    source: firstText(row.source),
+    updatedAt: firstText(row.updatedAt, row.updated_at)
+  };
+}
+
+function normalizeCssPackageKeys(input: unknown): string[] {
+  const values = Array.isArray(input) ? input : String(input || "").split(",");
+  return values
+    .map((item) => firstText(item))
+    .filter(Boolean)
+    .filter((item, index, list) => list.indexOf(item) === index);
+}
+
+function normalizeCssPackageEnv(input: unknown): string {
+  const value = normalizeEnv(input);
+  return value === "local-dev" ? "dev" : value;
+}
+
+async function getCssRegistryPackages(env: Env, body: any): Promise<Record<string, unknown>> {
+  const payload = normalizeRegistryPayload(body);
+  const requestedEnv = normalizeEnv(firstText(body.env, payload.env, payload.runtime, payload.requestedRuntime));
+  const appEnv = normalizeCssPackageEnv(requestedEnv);
+  const packageKeys = normalizeCssPackageKeys(payload.packageKeys ?? payload.packages);
+  const envs = ["global", appEnv].filter((item, index, list) => list.indexOf(item) === index);
+  const envFilter = envs.map((item) => encodeURIComponent(item)).join(",");
+  const table = DEFAULT_CSS_REGISTRY_PACKAGE_TABLE;
+  const path = `${encodeURIComponent(table)}?select=*&enabled=eq.true&env=in.(${envFilter})`;
+  const rows = await supabaseGetAllRows(env, path);
+  const preferred = new Map<string, Record<string, unknown>>();
+
+  rows
+    .map(normalizeCssPackageRow)
+    .filter((row) => !packageKeys.length || packageKeys.indexOf(firstText(row.packageKey)) >= 0)
+    .forEach((row) => {
+      const key = firstText(row.packageKey);
+      const current = preferred.get(key);
+      if (!current || firstText(row.env) === appEnv) preferred.set(key, row);
+    });
+
+  const packages = Array.from(preferred.values()).sort((a, b) => {
+    const orderDiff = Number(a.sortOrder || 0) - Number(b.sortOrder || 0);
+    return orderDiff || firstText(a.packageKey).localeCompare(firstText(b.packageKey));
+  });
+
+  return {
+    ok: true,
+    action: "getCssRegistryPackages",
+    source: "skhps-backend-supabase",
+    sourceLabel: "Supabase CssRegistryPackage / Cloudflare Worker",
+    env: appEnv,
+    requestedEnv,
+    envs,
+    packageKeys,
+    count: packages.length,
+    packages,
+    data: { packages }
+  };
+}
+
+function normalizeCssPackageManifest(input: unknown): Record<string, unknown> {
+  if (input && typeof input === "object" && !Array.isArray(input)) {
+    return input as Record<string, unknown>;
+  }
+  if (typeof input === "string" && input.trim()) {
+    try {
+      const parsed = JSON.parse(input);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {
+      throw new Error("INVALID_CSS_PACKAGE_MANIFEST");
+    }
+  }
+  return {};
+}
+
+async function saveCssRegistryPackage(env: Env, body: any): Promise<Record<string, unknown>> {
+  const payload = normalizeRegistryPayload(body);
+  const requestedTargetEnv = firstText(payload.targetEnv, payload.env).toLowerCase();
+  const targetEnv = normalizeCssPackageEnv(requestedTargetEnv);
+  const packageKey = firstText(payload.packageKey, payload.key);
+  const displayName = firstText(payload.displayName, payload.name, packageKey);
+  const version = firstText(payload.version, "0.1.0-dev");
+  const cssText = firstText(payload.cssText, payload.css);
+  const manifest = normalizeCssPackageManifest(payload.manifest);
+  const source = normalizeCssRegistrySource(payload.source || "css-setting-package-studio");
+  const sortOrder = Number(payload.sortOrder || 0);
+
+  if (targetEnv !== "dev") {
+    return {
+      ok: false,
+      action: "saveCssRegistryPackage",
+      error: "DEV_ONLY",
+      message: "CSS package 開發階段只允許寫入 local-dev/dev；prod/global 必須走日後獨立 promotion。"
+    };
+  }
+  if (!/^[a-z0-9][a-z0-9._-]{1,79}$/i.test(packageKey)) {
+    return { ok: false, action: "saveCssRegistryPackage", error: "INVALID_PACKAGE_KEY" };
+  }
+  if (!cssText.trim()) {
+    return { ok: false, action: "saveCssRegistryPackage", error: "EMPTY_CSS_TEXT" };
+  }
+  if (cssText.length > 250000) {
+    return { ok: false, action: "saveCssRegistryPackage", error: "CSS_PACKAGE_TOO_LARGE" };
+  }
+
+  const nowIso = new Date().toISOString();
+  const record = {
+    env: targetEnv,
+    package_key: packageKey,
+    display_name: displayName,
+    version,
+    manifest,
+    css_text: cssText,
+    enabled: payload.enabled !== false,
+    sort_order: Number.isFinite(sortOrder) ? sortOrder : 0,
+    source,
+    updated_at: nowIso
+  };
+
+  const revisions = await supabasePost<Record<string, unknown>[]>(
+    env,
+    DEFAULT_CSS_REGISTRY_PACKAGE_REVISION_TABLE,
+    record
+  );
+  const saved = await supabaseUpsert<Record<string, unknown>[]>(
+    env,
+    DEFAULT_CSS_REGISTRY_PACKAGE_TABLE,
+    record,
+    "env,package_key"
+  );
+
+  return {
+    ok: true,
+    action: "saveCssRegistryPackage",
+    source: "skhps-backend-supabase",
+    sourceLabel: "Supabase CssRegistryPackage / Cloudflare Worker",
+    targetEnv,
+    requestedTargetEnv,
+    packageKey,
+    version,
+    revisionId: firstText(revisions && revisions[0] && revisions[0].id),
+    package: saved && saved[0] ? normalizeCssPackageRow(saved[0], 0) : record,
+    updatedAt: nowIso
+  };
+}
+
 async function getCssRegistryRuntime(env: Env, body: any, action: string): Promise<Record<string, unknown>> {
   const payload = normalizeRegistryPayload(body);
   const appEnv = normalizeEnv(firstText(body.env, payload.env, payload.runtime, payload.requestedRuntime));
@@ -288,6 +452,16 @@ async function getCssRegistryRuntime(env: Env, body: any, action: string): Promi
     .map(normalizeCssRegistryRuntimeRow)
     .filter((row) => keySet.has(firstText(row.sheetKey, row.sheet_key, "cssMain")))
     .sort((a, b) => Number(a.__order ?? a.sort_order ?? 0) - Number(b.__order ?? b.sort_order ?? 0));
+  let packages: Record<string, unknown>[] = [];
+  let packageStatus = "ready";
+
+  try {
+    const packageResult = await getCssRegistryPackages(env, body);
+    packages = Array.isArray(packageResult.packages) ? packageResult.packages as Record<string, unknown>[] : [];
+  } catch (error) {
+    /* Migration 尚未套用時維持舊 rows 路徑，prod 行為不受影響。 */
+    packageStatus = "unavailable";
+  }
 
   return {
     ok: true,
@@ -301,10 +475,14 @@ async function getCssRegistryRuntime(env: Env, body: any, action: string): Promi
     registryKeys,
     sheetKeys: registryKeys,
     count: normalizedRows.length,
-    rows: normalizedRows
-    // 2026-07-17（加速）：移除 `data: { rows: normalizedRows }`——那是 rows 的
-    // 原封重複（2.15MB），前端 normalizeBackendRows 只讀 response.rows、從沒讀
-    // 過 data，純浪費。若未來有 client 依賴 data.rows 再回來加回。
+    rows: normalizedRows,
+    // 2026-07-17（加速）：不再放 `data: { rows }`——那是 rows 的原封重複
+    // （2.15MB），前端 normalizeBackendRows 只讀 response.rows，從沒讀過 data，
+    // 純浪費。packages 同理只放頂層：normalizeBackendPackages 優先讀
+    // response.packages，data.packages 只是沒人用的 fallback。
+    packages,
+    packageCount: packages.length,
+    packageStatus
   };
 }
 
@@ -360,7 +538,7 @@ async function saveCssRegistryRows(env: Env, body: any): Promise<Record<string, 
     };
   }
 
-  const table = "CssRegistryRule";
+  const table = getCssRegistryRuleTable(env);
   const components = rows
     .map((row) => row.component)
     .filter((item, index, list) => list.indexOf(item) === index);
@@ -464,7 +642,7 @@ async function deleteCssRegistryRows(env: Env, body: any): Promise<Record<string
     };
   }
 
-  const table = "CssRegistryRule";
+  const table = getCssRegistryRuleTable(env);
   let deletedRows = 0;
 
   for (const row of rows) {
@@ -4974,6 +5152,33 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
         ok: false,
         action,
         canonicalAction: "getCssRegistryRuntime",
+        source: "skhps-backend-supabase",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "getCssRegistryPackages") {
+    try {
+      return json(await getCssRegistryPackages(env, body));
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
+        source: "skhps-backend-supabase",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "saveCssRegistryPackage") {
+    try {
+      const result = await saveCssRegistryPackage(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
         source: "skhps-backend-supabase",
         error: error instanceof Error ? error.message : String(error)
       }, 500);
