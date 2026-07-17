@@ -2445,6 +2445,137 @@ function toQrSigninMeetingRowFromDates(input: {
   };
 }
 
+// 2026-07-17：ICS 私人 feed 對「重複事件」只給一筆母事件＋RRULE，不展開成
+// 每一次；原本的解析只讀母事件那一天，會漏掉窗口內其他發生（例如每月 10 號
+// 的「預班截止」）。以下實作把 RRULE 展開成窗口內的每一次，跟 GAS(CalendarApp)
+// 的原生展開對齊，做到「一場不少」。
+interface IcsRRule {
+  freq: string;
+  interval: number;
+  until: Date | null;
+  count: number;
+  byMonthDay: number[];
+  byDay: string[];
+}
+
+function parseIcsRRule(raw: string): IcsRRule | null {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  const map: Record<string, string> = {};
+  for (const part of text.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq > 0) map[part.slice(0, eq).trim().toUpperCase()] = part.slice(eq + 1).trim();
+  }
+  if (!map.FREQ) return null;
+  return {
+    freq: map.FREQ.toUpperCase(),
+    interval: Math.max(1, parseInt(map.INTERVAL || "1", 10) || 1),
+    until: map.UNTIL ? parseIcsDate(map.UNTIL) : null,
+    count: map.COUNT ? Math.max(0, parseInt(map.COUNT, 10) || 0) : 0,
+    byMonthDay: (map.BYMONTHDAY || "").split(",").map((s) => parseInt(s, 10)).filter((n) => Number.isFinite(n)),
+    byDay: (map.BYDAY || "").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean)
+  };
+}
+
+function icsWeekdayNum(day: string): number | null {
+  const key = String(day || "").replace(/^[+-]?\d+/, "").trim().toUpperCase();
+  const map: Record<string, number> = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+  return key in map ? map[key] : null;
+}
+
+function readIcsExDates(block: string): number[] {
+  const out: number[] = [];
+  for (const line of block.split("\n")) {
+    const colon = line.indexOf(":");
+    if (colon < 0) continue;
+    const left = line.slice(0, colon).toUpperCase();
+    if (left === "EXDATE" || left.startsWith("EXDATE;")) {
+      for (const v of line.slice(colon + 1).split(",")) {
+        const d = parseIcsDate(v.trim());
+        if (d) out.push(d.getTime());
+      }
+    }
+  }
+  return out;
+}
+
+// 把一個重複事件展開成 [windowStart, windowEnd] 內的每一次發生。emitted 從
+// DTSTART 起算（給 COUNT 用），只收窗口內、非 EXDATE、UNTIL 之前的。HARD_CAP
+// 防呆避免無限迴圈。
+function expandIcsOccurrences(
+  start: Date, end: Date, rrule: IcsRRule, exdates: number[],
+  windowStart: Date, windowEnd: Date
+): Array<{ start: Date; end: Date }> {
+  const out: Array<{ start: Date; end: Date }> = [];
+  const durationMs = Math.max(0, end.getTime() - start.getTime());
+  const untilMs = rrule.until ? rrule.until.getTime() : Infinity;
+  const wStart = windowStart.getTime();
+  const wEnd = windowEnd.getTime();
+  const exSet = new Set(exdates);
+  const hh = start.getHours(), mm = start.getMinutes(), ss = start.getSeconds();
+  const interval = rrule.interval;
+  const HARD_CAP = 2000;
+  let emitted = 0;
+  let stopped = false;
+
+  function take(d: Date): void {
+    const t = d.getTime();
+    if (!Number.isFinite(t)) return;
+    if (t < start.getTime()) return;
+    if (t > untilMs) { stopped = true; return; }
+    if (rrule.count && emitted >= rrule.count) { stopped = true; return; }
+    emitted += 1;
+    if (t >= wStart && t <= wEnd && !exSet.has(t)) {
+      out.push({ start: new Date(t), end: new Date(t + durationMs) });
+    }
+  }
+
+  if (rrule.freq === "DAILY") {
+    let d = new Date(start.getTime());
+    for (let i = 0; i < HARD_CAP && !stopped; i++) {
+      take(d);
+      if (d.getTime() > wEnd) break;
+      d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + interval, hh, mm, ss);
+    }
+  } else if (rrule.freq === "YEARLY") {
+    let d = new Date(start.getTime());
+    for (let i = 0; i < HARD_CAP && !stopped; i++) {
+      take(d);
+      if (d.getTime() > wEnd) break;
+      d = new Date(d.getFullYear() + interval, d.getMonth(), d.getDate(), hh, mm, ss);
+    }
+  } else if (rrule.freq === "WEEKLY") {
+    const dows = (rrule.byDay.length
+      ? rrule.byDay.map(icsWeekdayNum).filter((n): n is number => n !== null)
+      : [start.getDay()]).sort((a, b) => a - b);
+    let weekStart = new Date(start.getFullYear(), start.getMonth(), start.getDate() - start.getDay(), hh, mm, ss);
+    for (let w = 0; w < HARD_CAP && !stopped; w++) {
+      for (const dow of dows) {
+        take(new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + dow, hh, mm, ss));
+        if (stopped) break;
+      }
+      if (weekStart.getTime() > wEnd) break;
+      weekStart = new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + 7 * interval, hh, mm, ss);
+    }
+  } else if (rrule.freq === "MONTHLY") {
+    const doms = (rrule.byMonthDay.length ? rrule.byMonthDay : [start.getDate()]).slice().sort((a, b) => a - b);
+    let y = start.getFullYear(), mo = start.getMonth();
+    for (let i = 0; i < HARD_CAP && !stopped; i++) {
+      for (const dom of doms) {
+        const d = new Date(y, mo, dom, hh, mm, ss);
+        if (d.getMonth() === (((mo % 12) + 12) % 12)) take(d); // 略過該月沒有的日（如 2/30）
+        if (stopped) break;
+      }
+      if (new Date(y, mo, 1).getTime() > wEnd) break;
+      mo += interval;
+      while (mo >= 12) { mo -= 12; y += 1; }
+    }
+  } else {
+    take(new Date(start.getTime()));
+  }
+  return out;
+}
+
 function parseQrSigninIcsRows(text: string, env: Env, payload: Record<string, unknown>): Record<string, unknown>[] {
   const now = new Date();
   const lookbackDays = qrNumberFromEnv(payload.lookbackDays, qrNumberFromEnv(env.QR_SIGNIN_CALENDAR_LOOKBACK_DAYS, DEFAULT_QR_SIGNIN_LOOKBACK_DAYS));
@@ -2455,26 +2586,42 @@ function parseQrSigninIcsRows(text: string, env: Env, payload: Record<string, un
   const calendarId = getQrSigninCalendarId(env);
   const blocks = unfoldIcs(text).match(/BEGIN:VEVENT[\s\S]*?END:VEVENT/g) || [];
 
-  return blocks
-    .map((block) => {
-      const title = decodeIcsText(readIcsProperty(block, "SUMMARY"));
-      const uid = decodeIcsText(readIcsProperty(block, "UID"));
-      const start = parseIcsDate(readIcsProperty(block, "DTSTART"));
-      const end = parseIcsDate(readIcsProperty(block, "DTEND"));
-      if (!title || !start || !end) return null;
-      if (start.getTime() < first.getTime() || start.getTime() > last.getTime()) return null;
-      return toQrSigninMeetingRowFromDates({
-        envName,
-        title,
-        start,
-        end,
+  const rows: Record<string, unknown>[] = [];
+  for (const block of blocks) {
+    const title = decodeIcsText(readIcsProperty(block, "SUMMARY"));
+    const uid = decodeIcsText(readIcsProperty(block, "UID"));
+    const start = parseIcsDate(readIcsProperty(block, "DTSTART"));
+    const end = parseIcsDate(readIcsProperty(block, "DTEND"));
+    if (!title || !start || !end) continue;
+
+    const rrule = parseIcsRRule(readIcsProperty(block, "RRULE"));
+    if (!rrule) {
+      // 單場事件：跟原本一樣，只留窗口內的。
+      if (start.getTime() < first.getTime() || start.getTime() > last.getTime()) continue;
+      rows.push(toQrSigninMeetingRowFromDates({
+        envName, title, start, end,
         source: "google-calendar-ics",
         sourceId: uid || undefined,
         calendarId,
         metadata: { rawSource: "ics" }
-      });
-    })
-    .filter((item): item is Record<string, unknown> => !!item);
+      }));
+      continue;
+    }
+
+    // 週期性事件：展開窗口內的每一次（例如每月 10 號的「預班截止」），
+    // sourceId 帶上該次的時間戳確保各場唯一、不會被去重合併掉。
+    const exdates = readIcsExDates(block);
+    for (const occ of expandIcsOccurrences(start, end, rrule, exdates, first, last)) {
+      rows.push(toQrSigninMeetingRowFromDates({
+        envName, title, start: occ.start, end: occ.end,
+        source: "google-calendar-ics",
+        sourceId: uid ? `${uid}__${occ.start.getTime()}` : undefined,
+        calendarId,
+        metadata: { rawSource: "ics", recurrence: true }
+      }));
+    }
+  }
+  return rows;
 }
 
 function splitQrSigninCourseInfo(rawCourse: unknown, rawDate: unknown): { meeting: string; date: string; time: string } {
