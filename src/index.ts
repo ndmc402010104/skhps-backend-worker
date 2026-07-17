@@ -3042,6 +3042,14 @@ async function previewQrSigninCalendarMeetings(env: Env, body: any) {
 
   const meetings = rows.map((row) => qrSigninCalendarPreviewDisplay(row));
 
+  // 2026-07-17：依開始時間「由新到舊」排序，跟 QR 前台原本 GAS 下拉的順序一致
+  // （ICS 事件在 feed 裡的順序是隨機的，不排會讓下拉跳來跳去）。
+  meetings.sort((a, b) => {
+    const ta = Date.parse(String((a as any).startTime || (a as any).startsAt || "")) || 0;
+    const tb = Date.parse(String((b as any).startTime || (b as any).startsAt || "")) || 0;
+    return tb - ta;
+  });
+
   const result = {
     ok: true,
     action: "previewQrSigninCalendarMeetings",
