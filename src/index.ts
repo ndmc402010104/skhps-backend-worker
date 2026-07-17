@@ -333,6 +333,33 @@ async function resolveActiveTheme(env: Env, payload: Record<string, unknown>): P
   return DEFAULT_CSS_THEME;
 }
 
+/*
+ * §8 css-setting 儀表化：每個展示區要標出「這一區吃哪個 registry
+ * component、有幾條規則」，低於門檻就亮 inline-only 警示——這條 action
+ * 就是那個即時來源，不用寫死快照（快照會隨規則增修悄悄過期，違背
+ * 「反著看 css-setting 就知道誰沒改到」這個設計初衷）。
+ * 只撈 component 欄位分組計數，不回傳規則內容本身。
+ */
+async function getCssRegistryComponentStats(env: Env): Promise<Record<string, unknown>> {
+  const table = getCssRegistryRuleTable(env);
+  const rows = await supabaseGetAllRows(env, `${encodeURIComponent(table)}?select=component`);
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    const component = firstText((row as { component?: unknown }).component) || "(未分類)";
+    counts.set(component, (counts.get(component) || 0) + 1);
+  }
+  const components = Array.from(counts.entries())
+    .map(([component, ruleCount]) => ({ component, ruleCount }))
+    .sort((a, b) => a.component.localeCompare(b.component));
+
+  return {
+    ok: true,
+    action: "getCssRegistryComponentStats",
+    totalRules: rows.length,
+    components
+  };
+}
+
 async function getCssRegistryPackages(env: Env, body: any): Promise<Record<string, unknown>> {
   const payload = normalizeRegistryPayload(body);
   const requestedEnv = normalizeEnv(firstText(body.env, payload.env, payload.runtime, payload.requestedRuntime));
@@ -5194,6 +5221,19 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
         ok: false,
         action,
         canonicalAction: "getCssRegistryRuntime",
+        source: "skhps-backend-supabase",
+        error: error instanceof Error ? error.message : String(error)
+      }, 500);
+    }
+  }
+
+  if (action === "getCssRegistryComponentStats") {
+    try {
+      return json(await getCssRegistryComponentStats(env));
+    } catch (error) {
+      return json({
+        ok: false,
+        action,
         source: "skhps-backend-supabase",
         error: error instanceof Error ? error.message : String(error)
       }, 500);
