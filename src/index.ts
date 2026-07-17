@@ -302,11 +302,43 @@ function normalizeCssPackageEnv(input: unknown): string {
   return value === "local-dev" ? "dev" : value;
 }
 
+// 2026-07-17（§7 主題切換）：白名單制——只有列在這裡的名字算數，其餘一律
+// 退回預設，絕不把使用者輸入的字串直接拼進任何查詢或路徑。
+const CSS_THEME_WHITELIST = ["warm-sand", "theme40"];
+const DEFAULT_CSS_THEME = "warm-sand";
+
+/*
+ * 解析目前生效的主題：payload.theme 若在白名單內直接採用（per-browser
+ * 預覽用，CSS Setting 頁靠這個即時切換）；否則讀 Default 表的全站指標
+ * （scope="css", key="activeCssTheme"，複用既有 getAppDefaults 同一張表，
+ * 沒有新建表）；指標也不在白名單或讀取失敗，一律退回 warm-sand，不擋
+ * CSS 交付。
+ */
+async function resolveActiveTheme(env: Env, payload: Record<string, unknown>): Promise<string> {
+  const requested = firstText(payload.theme).trim();
+  if (CSS_THEME_WHITELIST.indexOf(requested) >= 0) return requested;
+
+  try {
+    const table = getAppDefaultTable(env);
+    const rows = await supabaseGet<Array<{ key: string; value: string }>>(
+      env,
+      `${table}?select=key,value&scope=eq.css&key=eq.activeCssTheme&limit=1`
+    );
+    const value = Array.isArray(rows) && rows[0] ? firstText(rows[0].value) : "";
+    if (CSS_THEME_WHITELIST.indexOf(value) >= 0) return value;
+  } catch {
+    /* 指標讀取失敗就退回預設主題，不擋 CSS 交付。 */
+  }
+
+  return DEFAULT_CSS_THEME;
+}
+
 async function getCssRegistryPackages(env: Env, body: any): Promise<Record<string, unknown>> {
   const payload = normalizeRegistryPayload(body);
   const requestedEnv = normalizeEnv(firstText(body.env, payload.env, payload.runtime, payload.requestedRuntime));
   const appEnv = normalizeCssPackageEnv(requestedEnv);
   const packageKeys = normalizeCssPackageKeys(payload.packageKeys ?? payload.packages);
+  const activeTheme = await resolveActiveTheme(env, payload);
   const envs = ["global", appEnv].filter((item, index, list) => list.indexOf(item) === index);
   const envFilter = envs.map((item) => encodeURIComponent(item)).join(",");
   const table = DEFAULT_CSS_REGISTRY_PACKAGE_TABLE;
@@ -317,6 +349,12 @@ async function getCssRegistryPackages(env: Env, body: any): Promise<Record<strin
   rows
     .map(normalizeCssPackageRow)
     .filter((row) => !packageKeys.length || packageKeys.indexOf(firstText(row.packageKey)) >= 0)
+    .filter((row) => {
+      // 沒掛 themeName 的是主題無關共用層（例如 entry-cards-base），任何
+      // 主題都要載入；掛了就只在對應主題下才算數。
+      const themeName = firstText((row.manifest as Record<string, unknown> | undefined)?.themeName);
+      return !themeName || themeName === activeTheme;
+    })
     .forEach((row) => {
       const key = firstText(row.packageKey);
       const current = preferred.get(key);
@@ -336,6 +374,7 @@ async function getCssRegistryPackages(env: Env, body: any): Promise<Record<strin
     env: appEnv,
     requestedEnv,
     envs,
+    theme: activeTheme,
     packageKeys,
     count: packages.length,
     packages,
@@ -454,10 +493,12 @@ async function getCssRegistryRuntime(env: Env, body: any, action: string): Promi
     .sort((a, b) => Number(a.__order ?? a.sort_order ?? 0) - Number(b.__order ?? b.sort_order ?? 0));
   let packages: Record<string, unknown>[] = [];
   let packageStatus = "ready";
+  let activeTheme = DEFAULT_CSS_THEME;
 
   try {
     const packageResult = await getCssRegistryPackages(env, body);
     packages = Array.isArray(packageResult.packages) ? packageResult.packages as Record<string, unknown>[] : [];
+    activeTheme = firstText(packageResult.theme) || DEFAULT_CSS_THEME;
   } catch (error) {
     /* Migration 尚未套用時維持舊 rows 路徑，prod 行為不受影響。 */
     packageStatus = "unavailable";
@@ -482,7 +523,8 @@ async function getCssRegistryRuntime(env: Env, body: any, action: string): Promi
     // response.packages，data.packages 只是沒人用的 fallback。
     packages,
     packageCount: packages.length,
-    packageStatus
+    packageStatus,
+    theme: activeTheme
   };
 }
 
