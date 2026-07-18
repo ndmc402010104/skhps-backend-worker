@@ -409,6 +409,62 @@ async function getCssRegistryPackages(env: Env, body: any): Promise<Record<strin
   };
 }
 
+// ── 頁面版面（Page Builder）：CssPageLayout 表，dev-only 寫入 ──
+async function getPageLayout(env: Env, body: any): Promise<Record<string, unknown>> {
+  const payload = normalizeRegistryPayload(body);
+  const appEnv = normalizeCssPackageEnv(firstText(body.env, payload.env, payload.runtime, payload.requestedRuntime) || "dev");
+  const pageKey = firstText(payload.pageKey, (payload as any).page_key, payload.key);
+  if (!pageKey) return { ok: false, action: "getPageLayout", error: "MISSING_PAGE_KEY" };
+  const rows = await supabaseGetAllRows(
+    env,
+    `CssPageLayout?env=eq.${encodeURIComponent(appEnv)}&page_key=eq.${encodeURIComponent(pageKey)}&enabled=eq.true&select=*`
+  );
+  return { ok: true, action: "getPageLayout", source: "skhps-backend-supabase", env: appEnv, pageKey, page: rows[0] || null };
+}
+
+async function listPageLayouts(env: Env, body: any): Promise<Record<string, unknown>> {
+  const payload = normalizeRegistryPayload(body);
+  const appEnv = normalizeCssPackageEnv(firstText(body.env, payload.env, payload.runtime, payload.requestedRuntime) || "dev");
+  const rows = await supabaseGetAllRows(
+    env,
+    `CssPageLayout?env=eq.${encodeURIComponent(appEnv)}&select=env,page_key,title,skin,enabled,updated_at&order=updated_at.desc`
+  );
+  return { ok: true, action: "listPageLayouts", source: "skhps-backend-supabase", env: appEnv, count: rows.length, pages: rows };
+}
+
+async function savePageLayout(env: Env, body: any): Promise<Record<string, unknown>> {
+  const payload = normalizeRegistryPayload(body);
+  const targetEnv = normalizeCssPackageEnv(firstText(payload.targetEnv, body.env, payload.env) || "dev");
+  const pageKey = firstText(payload.pageKey, (payload as any).page_key, payload.key);
+  const title = firstText(payload.title);
+  const skin = firstText(payload.skin) || "warm";
+  const layout = (payload as any).layoutJson ?? (payload as any).layout_json ?? (payload as any).layout;
+  if (targetEnv !== "dev") {
+    return { ok: false, action: "savePageLayout", error: "DEV_ONLY", message: "頁面版面開發階段只允許寫入 dev。" };
+  }
+  if (!/^[a-z0-9][a-z0-9._-]{1,79}$/i.test(pageKey)) {
+    return { ok: false, action: "savePageLayout", error: "INVALID_PAGE_KEY" };
+  }
+  if (!layout || typeof layout !== "object") {
+    return { ok: false, action: "savePageLayout", error: "INVALID_LAYOUT" };
+  }
+  if (JSON.stringify(layout).length > 500000) {
+    return { ok: false, action: "savePageLayout", error: "LAYOUT_TOO_LARGE" };
+  }
+  const record = {
+    env: targetEnv,
+    page_key: pageKey,
+    title,
+    skin,
+    layout_json: layout,
+    enabled: payload.enabled !== false,
+    source: normalizeCssRegistrySource(payload.source || "page-builder"),
+    updated_at: new Date().toISOString()
+  };
+  const saved = await supabaseUpsert<Record<string, unknown>[]>(env, "CssPageLayout", record, "env,page_key");
+  return { ok: true, action: "savePageLayout", source: "skhps-backend-supabase", env: targetEnv, pageKey, saved: Array.isArray(saved) ? saved[0] : saved };
+}
+
 function normalizeCssPackageManifest(input: unknown): Record<string, unknown> {
   if (input && typeof input === "object" && !Array.isArray(input)) {
     return input as Record<string, unknown>;
@@ -5264,6 +5320,25 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
         source: "skhps-backend-supabase",
         error: error instanceof Error ? error.message : String(error)
       }, 500);
+    }
+  }
+
+  if (action === "getPageLayout") {
+    try { return json(await getPageLayout(env, body)); }
+    catch (error) { return json({ ok: false, action, source: "skhps-backend-supabase", error: error instanceof Error ? error.message : String(error) }, 500); }
+  }
+
+  if (action === "listPageLayouts") {
+    try { return json(await listPageLayouts(env, body)); }
+    catch (error) { return json({ ok: false, action, source: "skhps-backend-supabase", error: error instanceof Error ? error.message : String(error) }, 500); }
+  }
+
+  if (action === "savePageLayout") {
+    try {
+      const result = await savePageLayout(env, body);
+      return json(result, result.ok === false ? 400 : 200);
+    } catch (error) {
+      return json({ ok: false, action, source: "skhps-backend-supabase", error: error instanceof Error ? error.message : String(error) }, 500);
     }
   }
 
