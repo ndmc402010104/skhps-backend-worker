@@ -2,3 +2,7 @@ node_modules/
 .wrangler/
 .dev.vars
 .env
+
+# 一次性除錯／匯出產物（可重生，不進版控）
+all_css_rules.json
+/check-*.sql
