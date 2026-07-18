@@ -640,7 +640,8 @@ function normalizeCssRegistrySource(input: unknown): string {
 /*
  * CSS Setting Studio 存檔目標。Google Sheet 已 retire，這是唯一的寫入路徑。
  * 固定寫 env=global / layer=override，對應舊 Sheet 時代「目前值」那一列（不是 default 列）。
- * sort_order 沿用既有列的值，避免每次存檔都把排序打回 0。
+ * sort_order：既有列沿用原值（不打亂排序）；新列給「全域 max+1」遞增，讓 override 新寫入
+ * 天生排在最後、蓋得過 sort_order 幾百~幾千的舊規則（2026-07-18 治本，不再靠 !important）。
  */
 async function saveCssRegistryRows(env: Env, body: any): Promise<Record<string, unknown>> {
   const payload = normalizeRegistryPayload(body);
@@ -688,6 +689,15 @@ async function saveCssRegistryRows(env: Env, body: any): Promise<Record<string, 
   const nowIso = new Date().toISOString();
   let updatedCount = 0;
 
+  // sort_order gap 治本（2026-07-18）：override 層新規則以前一律給 0，會排在所有舊規則「前面」、
+  // 被 sort_order 幾百~幾千的舊規則蓋掉（CSS specificity 相同時排後面的贏），只能靠 !important 頂。
+  // 改成：新規則從「全域現有 max sort_order + 1」遞增，天生排在最後、蓋得過舊規則。既有規則沿用原值不打亂。
+  const maxSortRows = await supabaseGet<Record<string, unknown>[]>(
+    env,
+    `${encodeURIComponent(table)}?env=eq.global&select=sort_order&order=sort_order.desc.nullslast&limit=1`
+  );
+  let nextNewSort = (maxSortRows.length ? Number(maxSortRows[0].sort_order ?? 0) : 0) + 1;
+
   const records = rows.map((row) => {
     const key = sortOrderKey(row.component, row.selector, row.property);
     const isExisting = existingSortOrder.has(key);
@@ -704,7 +714,7 @@ async function saveCssRegistryRows(env: Env, body: any): Promise<Record<string, 
       source_updated_at: nowIso,
       layer: "override",
       enabled: true,
-      sort_order: existingSortOrder.get(key) ?? 0,
+      sort_order: isExisting ? (existingSortOrder.get(key) ?? 0) : nextNewSort++,
       source
     };
   });
