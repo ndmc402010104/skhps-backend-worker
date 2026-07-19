@@ -432,6 +432,83 @@ async function listPageLayouts(env: Env, body: any): Promise<Record<string, unkn
   return { ok: true, action: "listPageLayouts", source: "skhps-backend-supabase", env: appEnv, count: rows.length, pages: rows };
 }
 
+// 2026-07-19（批次1回滾）：存檔前先讀「現在雲端上是誰」，寫進
+// CssPageLayout_History 當快照，revision 才 +1——覆蓋前一定留一份，
+// 版本歷史 UI／restorePageLayout 才有東西可以還原。
+async function fetchCurrentPageLayoutRow(env: Env, targetEnv: string, pageKey: string): Promise<Record<string, unknown> | null> {
+  const rows = await supabaseGetAllRows(
+    env,
+    `CssPageLayout?env=eq.${encodeURIComponent(targetEnv)}&page_key=eq.${encodeURIComponent(pageKey)}&select=*`
+  );
+  return rows[0] || null;
+}
+
+async function archivePageLayoutRow(env: Env, current: Record<string, unknown>): Promise<void> {
+  await supabasePost(env, "CssPageLayout_History", {
+    env: current.env,
+    page_key: current.page_key,
+    revision: current.revision,
+    title: current.title || "",
+    skin: current.skin || "warm",
+    layout_json: current.layout_json || {},
+    saved_at: current.updated_at || null,
+    source: current.source || ""
+  });
+}
+
+type PageLayoutWriteInput = {
+  title: string;
+  skin: string;
+  layout: unknown;
+  enabled: boolean;
+  source: string;
+};
+
+type PageLayoutWriteResult =
+  | { ok: true; row: Record<string, unknown> }
+  | { ok: false; error: string; currentRevision: number };
+
+/*
+ * 共用寫入邏輯：savePageLayout（樂觀鎖存檔）、restorePageLayout（還原成
+ * 新版本）都走這裡——先讀現況→（revision 對不上就 409）→現況存進歷史
+ * →revision+1 寫入。restorePageLayout 不傳 expectedRevision，永遠不衝突
+ * （還原動作本身就是「不管現在是誰，都先存檔再蓋過去」，不會弄丟資料，
+ * 因為現況一定會先被存進歷史）。
+ */
+async function writePageLayoutRecord(
+  env: Env,
+  targetEnv: string,
+  pageKey: string,
+  input: PageLayoutWriteInput,
+  expectedRevision?: number
+): Promise<PageLayoutWriteResult> {
+  const current = await fetchCurrentPageLayoutRow(env, targetEnv, pageKey);
+
+  if (current && expectedRevision != null && Number(current.revision) !== Number(expectedRevision)) {
+    return { ok: false, error: "REVISION_CONFLICT", currentRevision: Number(current.revision) };
+  }
+
+  if (current) {
+    await archivePageLayoutRow(env, current);
+  }
+
+  const nextRevision = current ? Number(current.revision || 1) + 1 : 1;
+  const record = {
+    env: targetEnv,
+    page_key: pageKey,
+    title: input.title,
+    skin: input.skin,
+    layout_json: input.layout,
+    enabled: input.enabled,
+    source: input.source,
+    revision: nextRevision,
+    updated_at: new Date().toISOString()
+  };
+  const saved = await supabaseUpsert<Record<string, unknown>[]>(env, "CssPageLayout", record, "env,page_key");
+  const row = Array.isArray(saved) ? saved[0] : (saved as unknown as Record<string, unknown>);
+  return { ok: true, row };
+}
+
 async function savePageLayout(env: Env, body: any): Promise<Record<string, unknown>> {
   const payload = normalizeRegistryPayload(body);
   const targetEnv = normalizeCssPackageEnv(firstText(payload.targetEnv, body.env, payload.env) || "dev");
@@ -439,6 +516,8 @@ async function savePageLayout(env: Env, body: any): Promise<Record<string, unkno
   const title = firstText(payload.title);
   const skin = firstText(payload.skin) || "warm";
   const layout = (payload as any).layoutJson ?? (payload as any).layout_json ?? (payload as any).layout;
+  const expectedRevisionRaw = (payload as any).expectedRevision ?? (payload as any).expected_revision;
+  const expectedRevision = expectedRevisionRaw == null || expectedRevisionRaw === "" ? undefined : Number(expectedRevisionRaw);
   if (targetEnv !== "dev") {
     return { ok: false, action: "savePageLayout", error: "DEV_ONLY", message: "頁面版面開發階段只允許寫入 dev。" };
   }
@@ -451,18 +530,80 @@ async function savePageLayout(env: Env, body: any): Promise<Record<string, unkno
   if (JSON.stringify(layout).length > 500000) {
     return { ok: false, action: "savePageLayout", error: "LAYOUT_TOO_LARGE" };
   }
-  const record = {
+
+  const result = await writePageLayoutRecord(
+    env,
+    targetEnv,
+    pageKey,
+    {
+      title,
+      skin,
+      layout,
+      enabled: payload.enabled !== false,
+      source: normalizeCssRegistrySource(payload.source || "page-builder")
+    },
+    expectedRevision
+  );
+
+  if (!result.ok) {
+    return { ok: false, action: "savePageLayout", error: result.error, env: targetEnv, pageKey, currentRevision: result.currentRevision };
+  }
+
+  return { ok: true, action: "savePageLayout", source: "skhps-backend-supabase", env: targetEnv, pageKey, revision: result.row.revision, saved: result.row };
+}
+
+async function listPageLayoutHistory(env: Env, body: any): Promise<Record<string, unknown>> {
+  const payload = normalizeRegistryPayload(body);
+  const appEnv = normalizeCssPackageEnv(firstText(body.env, payload.env, payload.runtime, payload.requestedRuntime) || "dev");
+  const pageKey = firstText(payload.pageKey, (payload as any).page_key, payload.key);
+  if (!pageKey) return { ok: false, action: "listPageLayoutHistory", error: "MISSING_PAGE_KEY" };
+  const rows = await supabaseGetAllRows(
+    env,
+    `CssPageLayout_History?env=eq.${encodeURIComponent(appEnv)}&page_key=eq.${encodeURIComponent(pageKey)}&select=id,env,page_key,revision,title,skin,saved_at,archived_at,source&order=revision.desc`
+  );
+  return { ok: true, action: "listPageLayoutHistory", source: "skhps-backend-supabase", env: appEnv, pageKey, count: rows.length, history: rows };
+}
+
+async function restorePageLayout(env: Env, body: any): Promise<Record<string, unknown>> {
+  const payload = normalizeRegistryPayload(body);
+  const targetEnv = normalizeCssPackageEnv(firstText(payload.targetEnv, body.env, payload.env) || "dev");
+  const pageKey = firstText(payload.pageKey, (payload as any).page_key, payload.key);
+  const revision = Number((payload as any).revision);
+  if (targetEnv !== "dev") {
+    return { ok: false, action: "restorePageLayout", error: "DEV_ONLY", message: "頁面版面開發階段只允許寫入 dev。" };
+  }
+  if (!pageKey) return { ok: false, action: "restorePageLayout", error: "MISSING_PAGE_KEY" };
+  if (!Number.isFinite(revision) || revision < 1) return { ok: false, action: "restorePageLayout", error: "INVALID_REVISION" };
+
+  const historyRows = await supabaseGetAllRows(
+    env,
+    `CssPageLayout_History?env=eq.${encodeURIComponent(targetEnv)}&page_key=eq.${encodeURIComponent(pageKey)}&revision=eq.${revision}&select=*&limit=1`
+  );
+  const snapshot = historyRows[0];
+  if (!snapshot) return { ok: false, action: "restorePageLayout", error: "HISTORY_NOT_FOUND" };
+
+  const result = await writePageLayoutRecord(env, targetEnv, pageKey, {
+    title: firstText(snapshot.title),
+    skin: firstText(snapshot.skin) || "warm",
+    layout: snapshot.layout_json || {},
+    enabled: true,
+    source: normalizeCssRegistrySource("page-builder-restore")
+  });
+
+  if (!result.ok) {
+    return { ok: false, action: "restorePageLayout", error: result.error, env: targetEnv, pageKey };
+  }
+
+  return {
+    ok: true,
+    action: "restorePageLayout",
+    source: "skhps-backend-supabase",
     env: targetEnv,
-    page_key: pageKey,
-    title,
-    skin,
-    layout_json: layout,
-    enabled: payload.enabled !== false,
-    source: normalizeCssRegistrySource(payload.source || "page-builder"),
-    updated_at: new Date().toISOString()
+    pageKey,
+    restoredFromRevision: revision,
+    revision: result.row.revision,
+    saved: result.row
   };
-  const saved = await supabaseUpsert<Record<string, unknown>[]>(env, "CssPageLayout", record, "env,page_key");
-  return { ok: true, action: "savePageLayout", source: "skhps-backend-supabase", env: targetEnv, pageKey, saved: Array.isArray(saved) ? saved[0] : saved };
 }
 
 function normalizeCssPackageManifest(input: unknown): Record<string, unknown> {
@@ -1996,49 +2137,62 @@ function mergeNewStaffIntoQuickLoginPerson(
   };
 }
 
-async function getQuickLoginStaff(env: Env, appEnv: AppEnvName) {
+async function getQuickLoginStaff(env: Env, appEnv: AppEnvName, bypassCache?: boolean) {
   const tableName = getStaffTable(env);
   const newStaffTableName = getQuickLoginNewStaffTable();
-  /* StaffMaster 也不從 KV 回傳；保留 appEnv 只作診斷。 */
+  /* StaffMaster/NewStaff 都不是 env 分表（沒有 env 欄位），保留 appEnv 只作回應診斷。 */
   void appEnv;
 
-  let latestNewStaffByEmp: Record<string, StaffMasterRow> = {};
-  let newStaffError = "";
-
-  // 2026-07-17（加速）：StaffMaster 與 NewStaff 兩個查詢互相獨立，原本是
-  // 序列 await（撈完 StaffMaster 才撈 NewStaff），改成 Promise.all 並行，
-  // 省掉一個查詢的往返（實測 quick-login-staff task ~2s 主要就是這兩個序列
-  // Supabase 查詢）。NewStaff 失敗不影響主名單，catch 後留空覆蓋（行為不變）。
-  const [rows, newStaffResult] = await Promise.all([
-    supabaseGet<StaffMasterRow[]>(env, `${encodeURIComponent(tableName)}?select=*`),
-    getLatestNewStaffByEmp(env).then(
-      (value) => ({ ok: true as const, value }),
-      (error) => ({ ok: false as const, error: error instanceof Error ? error.message : String(error) })
-    )
-  ]);
-  if (newStaffResult.ok) {
-    latestNewStaffByEmp = newStaffResult.value;
-  } else {
-    newStaffError = newStaffResult.error;
+  // 2026-07-19（批次1效能，取代 2026-07-17 的 Promise.all 並行版）：StaffMaster 全量＋
+  // NewStaff 全量在 JS 端算「每個員編最新一筆有密碼的覆蓋」，過去是兩個獨立 Supabase
+  // 查詢（就算並行仍是兩趟 worker→Supabase 網路來回，quick-login-staff task ~1-2s
+  // 主要就是這個）。改法：把 LATERAL join＋去重邏輯搬進 SQL view
+  // `QuickLoginStaffMerged`（migration add_quick_login_staff_merged_view，
+  // NewStaff 沒有姓名/職級等欄位，一直只貢獻密碼覆蓋——非密碼欄位原本就是
+  // fallback 回 StaffMaster 原值，這裡忠實保留同一行為），worker 只打一次。
+  const cacheKey = "quick-login-staff:v1";
+  if (!bypassCache && env.SKHPS_CACHE) {
+    try {
+      const cached = await env.SKHPS_CACHE.get(cacheKey);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        parsed.env = appEnv;
+        parsed.cache = "hit";
+        return parsed;
+      }
+    } catch { /* 快取讀失敗就當 miss，繼續正常查 */ }
   }
 
-  const staffPeople = rows.map((row) => toQuickLoginPerson(row, tableName));
-  const staffByEmp = new Map<string, QuickLoginPerson>();
-  const newStaffEmpList = Object.keys(latestNewStaffByEmp);
+  type MergedRow = StaffMasterRow & { newstaff_password?: string | null; newstaff_added_at?: string | null };
+  let rows: MergedRow[] = [];
+  let queryError = "";
+  try {
+    rows = await supabaseGet<MergedRow[]>(env, "QuickLoginStaffMerged?select=*");
+  } catch (error) {
+    queryError = error instanceof Error ? error.message : String(error);
+  }
+
   let newStaffOverrideCount = 0;
-
-  // 員編大小寫視為同一個帳號，這裡的 key 跟 getLatestNewStaffByEmp() 的 dedup key
-  // 用同一套「一律轉大寫」規則，兩邊 key 才對得起來。
-  for (const person of staffPeople) {
-    if (person.emp) staffByEmp.set(String(person.emp).toUpperCase(), person);
-  }
-
-  const staffList = staffPeople
-    .map((person) => {
-      const newStaffRow = person.emp ? latestNewStaffByEmp[String(person.emp).toUpperCase()] : null;
-      if (!newStaffRow) return person;
+  const staffList = rows
+    .map((row) => {
+      const person = toQuickLoginPerson(row, tableName);
+      const overridePassword = stringValue(row, ["newstaff_password"], "");
+      if (!overridePassword) return person;
       newStaffOverrideCount += 1;
-      return mergeNewStaffIntoQuickLoginPerson(person, newStaffRow, newStaffTableName);
+      const addedAt = stringValue(row, ["newstaff_added_at"], "");
+      return {
+        ...person,
+        password: overridePassword,
+        updatedAt: addedAt || person.updatedAt,
+        metadata: {
+          ...person.metadata,
+          passwordSource: "NewStaff",
+          passwordSourceTable: newStaffTableName,
+          newStaffAddedAt: addedAt,
+          sourcePriority: "NewStaff"
+        },
+        source: "supabase-newstaff"
+      };
     })
     .filter((person) => person.active && person.allowQuickLogin && person.name && person.emp)
     .sort((a, b) => {
@@ -2047,7 +2201,6 @@ async function getQuickLoginStaff(env: Env, appEnv: AppEnvName) {
       return String(a.emp || "").localeCompare(String(b.emp || ""));
     })
     .map((person) => ({ ...person, hasPassword: hasUsablePassword(person.password) }));
-  const newStaffIgnoredCount = newStaffEmpList.filter((emp) => !staffByEmp.has(emp)).length;
   const extraList: QuickLoginPerson[] = [];
 
   const payload = {
@@ -2057,19 +2210,26 @@ async function getQuickLoginStaff(env: Env, appEnv: AppEnvName) {
     env: appEnv,
     staffTable: tableName,
     newStaffTable: newStaffTableName,
-    newStaffLatestCount: newStaffEmpList.length,
     newStaffOverrideCount,
-    newStaffIgnoredCount,
-    newStaffError,
+    newStaffError: queryError,
     passwordFallbackTable: newStaffTableName,
     passwordFallbackCount: newStaffOverrideCount,
-    passwordFallbackError: newStaffError,
+    passwordFallbackError: queryError,
     count: staffList.length,
     cachedAt: new Date().toISOString(),
+    cache: "miss",
     staffList,
     extraList
   };
 
+  // 只快取成功查詢（queryError 空、至少有資料）；短 TTL——人員名單很少變，
+  // 但密碼是登入用的敏感/關鍵資料，不想讓變更後的可見延遲拖太久。60 秒是
+  // Cloudflare KV expirationTtl 允許的最小值（試過 30 秒，PUT 直接 400）。
+  if (env.SKHPS_CACHE && !queryError && staffList.length > 0) {
+    try {
+      await env.SKHPS_CACHE.put(cacheKey, JSON.stringify(payload), { expirationTtl: 60 });
+    } catch { /* 快取寫失敗不影響回應 */ }
+  }
 
   return payload;
 }
@@ -5356,6 +5516,21 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
   if (action === "savePageLayout") {
     try {
       const result = await savePageLayout(env, body);
+      const status = result.ok === false ? (result.error === "REVISION_CONFLICT" ? 409 : 400) : 200;
+      return json(result, status);
+    } catch (error) {
+      return json({ ok: false, action, source: "skhps-backend-supabase", error: error instanceof Error ? error.message : String(error) }, 500);
+    }
+  }
+
+  if (action === "listPageLayoutHistory") {
+    try { return json(await listPageLayoutHistory(env, body)); }
+    catch (error) { return json({ ok: false, action, source: "skhps-backend-supabase", error: error instanceof Error ? error.message : String(error) }, 500); }
+  }
+
+  if (action === "restorePageLayout") {
+    try {
+      const result = await restorePageLayout(env, body);
       return json(result, result.ok === false ? 400 : 200);
     } catch (error) {
       return json({ ok: false, action, source: "skhps-backend-supabase", error: error instanceof Error ? error.message : String(error) }, 500);
