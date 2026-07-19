@@ -1867,6 +1867,15 @@ type QuickLoginPerson = {
   source: string;
 };
 
+/* 快速登入頁「無密碼帳號要標記」用：跟前端 quick-login/assets/js/app.js 的
+   normalizeLoginPassword 佔位字清單同步，密碼本身仍不外流——只回傳這個布林。 */
+const QUICK_LOGIN_PASSWORD_PLACEHOLDERS = new Set(["empty", "null", "undefined", "n/a", "na", "-", "--"]);
+function hasUsablePassword(value: string): boolean {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return false;
+  return !QUICK_LOGIN_PASSWORD_PLACEHOLDERS.has(trimmed.toLowerCase());
+}
+
 function toQuickLoginPerson(row: StaffMasterRow, tableName: string): QuickLoginPerson {
   const metadata = rowMetadata(row);
 
@@ -2036,7 +2045,8 @@ async function getQuickLoginStaff(env: Env, appEnv: AppEnvName) {
       const orderDiff = Number(a.sortOrder || 999) - Number(b.sortOrder || 999);
       if (orderDiff !== 0) return orderDiff;
       return String(a.emp || "").localeCompare(String(b.emp || ""));
-    });
+    })
+    .map((person) => ({ ...person, hasPassword: hasUsablePassword(person.password) }));
   const newStaffIgnoredCount = newStaffEmpList.filter((emp) => !staffByEmp.has(emp)).length;
   const extraList: QuickLoginPerson[] = [];
 
